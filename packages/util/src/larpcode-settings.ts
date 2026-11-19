@@ -8,7 +8,8 @@ import { roots } from "#global-roots"
 // restart. Missing file means the defaults below.
 const FILE = path.join(roots("opencode").data, "larpcode-settings.json")
 
-export type Key = "autoRotate" | "freeFallback" | "forceTor"
+export type Egress = "warp" | "tor"
+export type Key = "autoRotate" | "freeFallback" | "forceTor" | "egress"
 export type Source = "env" | "file" | "default"
 
 export type Stored = {
@@ -16,6 +17,7 @@ export type Stored = {
   autoRotateMaxPerHour?: number
   freeFallback?: boolean
   forceTor?: boolean
+  egress?: Egress
 }
 
 export type Resolved = {
@@ -23,6 +25,7 @@ export type Resolved = {
   autoRotateMaxPerHour: number
   freeFallback: boolean
   forceTor: boolean
+  egress: Egress
 }
 
 export type Patch = Partial<Resolved>
@@ -32,6 +35,7 @@ export const Defaults: Resolved = {
   autoRotateMaxPerHour: 30,
   freeFallback: true,
   forceTor: false,
+  egress: "warp",
 }
 
 export function filePath() {
@@ -67,6 +71,11 @@ function envNumber(name: string): number | undefined {
   return Number.isFinite(value) && value >= 1 ? Math.floor(value) : undefined
 }
 
+function envEgress(name: string): Egress | undefined {
+  const value = process.env[name]?.trim().toLowerCase()
+  return value === "warp" || value === "tor" ? value : undefined
+}
+
 function storedBool(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined
 }
@@ -75,8 +84,21 @@ function storedNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) && value >= 1 ? Math.floor(value) : undefined
 }
 
+function storedEgress(value: unknown): Egress | undefined {
+  return value === "warp" || value === "tor" ? value : undefined
+}
+
 export function resolved(): Resolved {
   const state = read()
+  // `egress` is the public choice. `forceTor` stays as a compatibility alias
+  // because the bootstrap and Tor dispatcher installed before this setting
+  // existed, and older larpcode-settings.json files only carry forceTor.
+  const forced = envBool("LARPCODE_FORCE_TOR")
+  const egress =
+    envEgress("LARPCODE_EGRESS") ??
+    (forced === true ? "tor" : forced === false ? "warp" : undefined) ??
+    storedEgress(state.egress) ??
+    (storedBool(state.forceTor) === true ? "tor" : Defaults.egress)
   return {
     autoRotate: envBool("LARPCODE_AUTO_ROTATE") ?? storedBool(state.autoRotate) ?? Defaults.autoRotate,
     autoRotateMaxPerHour:
@@ -84,7 +106,8 @@ export function resolved(): Resolved {
       storedNumber(state.autoRotateMaxPerHour) ??
       Defaults.autoRotateMaxPerHour,
     freeFallback: envBool("LARPCODE_FREE_FALLBACK") ?? storedBool(state.freeFallback) ?? Defaults.freeFallback,
-    forceTor: envBool("LARPCODE_FORCE_TOR") ?? storedBool(state.forceTor) ?? Defaults.forceTor,
+    forceTor: egress === "tor",
+    egress,
   }
 }
 
@@ -92,10 +115,17 @@ export function sources(): Record<Key, Source> {
   const state = read()
   const source = (env: string, value: unknown): Source =>
     envBool(env) !== undefined ? "env" : storedBool(value) !== undefined ? "file" : "default"
+  const egressSource: Source =
+    envEgress("LARPCODE_EGRESS") !== undefined || envBool("LARPCODE_FORCE_TOR") !== undefined
+      ? "env"
+      : storedEgress(state.egress) !== undefined || storedBool(state.forceTor) !== undefined
+        ? "file"
+        : "default"
   return {
     autoRotate: source("LARPCODE_AUTO_ROTATE", state.autoRotate),
     freeFallback: source("LARPCODE_FREE_FALLBACK", state.freeFallback),
-    forceTor: source("LARPCODE_FORCE_TOR", state.forceTor),
+    forceTor: egressSource,
+    egress: egressSource,
   }
 }
 
@@ -104,7 +134,14 @@ export function set(patch: Patch): Resolved {
   const next: Stored = { ...current }
   if (patch.autoRotate !== undefined) next.autoRotate = Boolean(patch.autoRotate)
   if (patch.freeFallback !== undefined) next.freeFallback = Boolean(patch.freeFallback)
-  if (patch.forceTor !== undefined) next.forceTor = Boolean(patch.forceTor)
+  if (patch.egress !== undefined) {
+    if (patch.egress !== "warp" && patch.egress !== "tor") throw new Error("egress must be warp or tor")
+    next.egress = patch.egress
+    next.forceTor = patch.egress === "tor"
+  } else if (patch.forceTor !== undefined) {
+    next.forceTor = Boolean(patch.forceTor)
+    next.egress = patch.forceTor ? "tor" : "warp"
+  }
   if (patch.autoRotateMaxPerHour !== undefined) {
     const value = Number(patch.autoRotateMaxPerHour)
     if (!Number.isFinite(value) || value < 1) throw new Error("autoRotateMaxPerHour must be at least 1")

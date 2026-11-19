@@ -14,6 +14,7 @@ import { Form } from "./form.js"
 import { InstallationEvent } from "./installation-event.js"
 import { Integration } from "./integration.js"
 import { LegacyEventV1 } from "./legacy-event.js"
+import { LarpcodeEvent } from "./larpcode-event.js"
 import { LspEvent } from "./lsp-event.js"
 import { LocationEvent } from "./location-event.js"
 import { McpEvent } from "./mcp-event.js"
@@ -76,6 +77,7 @@ export const ServerDefinitions = Event.inventory(
   ...SessionStatusEvent.Definitions,
   ...TuiEvent.Definitions,
   ...InstallationEvent.Definitions,
+  ...LarpcodeEvent.Definitions,
   ...VcsEvent.Definitions,
   McpEvent.StatusChanged,
   McpEvent.ResourcesChanged,

@@ -1,7 +1,8 @@
 import { NodeFileSystem } from "@effect/platform-node"
 import { expect, test } from "bun:test"
 import { Effect, FileSystem } from "effect"
-import { writeFile } from "node:fs/promises"
+import { rename, writeFile } from "node:fs/promises"
+import { join } from "node:path"
 import { Service, type EnsureReason } from "../src/effect/service"
 import {
   catchesSigterm,
@@ -81,6 +82,41 @@ test("adds configured environment variables when starting a service", async () =
 
   expect(endpoint.url).toBe(info.url)
   expect(await Bun.file(registration + ".environment").text()).toBe("configured")
+})
+
+test("adopts a service registered under another channel name", async () => {
+  await using fixture = await serviceFixture()
+  fixture.spawn("graceful")
+  await fixture.waitForFile()
+  const written = join(fixture.directory, "service-prod.json")
+  await rename(fixture.registration, written)
+
+  const discovered = await run(
+    Service.discover({
+      file: join(fixture.directory, "service-local.json"),
+      directory: fixture.directory,
+      version: "test",
+    }),
+  )
+  expect(discovered?.url).toBe((await Bun.file(written).json()).url)
+})
+
+test("starts a service that registers under another channel name", async () => {
+  await using fixture = await serviceFixture()
+  const written = join(fixture.directory, "service-prod.json")
+
+  const endpoint = await run(
+    ensure({
+      file: join(fixture.directory, "service-local.json"),
+      directory: fixture.directory,
+      version: "test",
+      command: [process.execPath, join(import.meta.dir, "fixture", "service.ts"), written, "delayed", "10"],
+    }),
+  )
+  const info = await Bun.file(written).json()
+  fixture.track(info.pid)
+
+  expect(endpoint.url).toBe(info.url)
 })
 
 test("replaces an incompatible registered service", async () => {

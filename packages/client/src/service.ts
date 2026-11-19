@@ -17,6 +17,12 @@ export type Endpoint = {
 export type DiscoverOptions = {
   /** Absolute registration file path. Defaults to the XDG state directory. */
   readonly file?: string
+  /**
+   * Directory scanned in addition to `file` for channel-specific `service*.json` registrations. A
+   * build and the client that starts it can disagree on the channel name, so whoever starts the
+   * service may need to adopt the file it actually wrote.
+   */
+  readonly directory?: string
   /** Required exact service version or compatibility predicate. */
   readonly version?: string | ((version: string) => boolean)
 }

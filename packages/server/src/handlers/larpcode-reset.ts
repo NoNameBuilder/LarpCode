@@ -2,15 +2,13 @@ import { Database } from "@opencode/core/database/database"
 import { Effect } from "effect"
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http"
 import { sql } from "drizzle-orm"
-import { appendFileSync, existsSync, mkdirSync, statSync, writeFileSync } from "node:fs"
+import { appendFileSync, mkdirSync, statSync, writeFileSync } from "node:fs"
 import { randomBytes as nodeRandomBytes } from "node:crypto"
-import { execFile } from "node:child_process"
-import { promisify } from "node:util"
 import * as os from "node:os"
 import * as path from "node:path"
-import { ensureTor, signalNewNym, probeExitIp } from "@opencode/core/larpcode-tor"
-import { recycleTorPool } from "@opencode/core/larpcode-socks-dispatcher"
+import { rotateEgress } from "@opencode/core/larpcode-egress"
 import { LarpcodeAbliterated } from "@opencode/core/larpcode-abliterated"
+import * as LarpcodeImpersonateFetch from "@opencode/util/larpcode-impersonate-fetch"
 
 // LarpCode: side-channel routes the Reset button and the Abliterated setting
 // call. There is no license, activation or signed-directive layer here: the
@@ -74,17 +72,24 @@ export const LarpcodeResetLayer = HttpRouter.use((router) =>
     // lost silently.
     yield* router.add("OPTIONS", "/_larpcode/export-sessions", preflight)
     yield* router.add("OPTIONS", "/_larpcode/reset-limits", preflight)
+    yield* router.add("OPTIONS", "/_larpcode/free-route/retry", preflight)
     yield* router.add("OPTIONS", "/_larpcode/abliterated", preflight)
     yield* router.add("OPTIONS", "/_larpcode/abliterated/content", preflight)
     yield* router.add(
       "GET",
       "/_larpcode/abliterated/content",
       Effect.gen(function* () {
+        const request = yield* HttpServerRequest.HttpServerRequest
+        const url = new URL(request.url, "http://localhost")
+        const model = LarpcodeAbliterated.modelRef(url.searchParams.get("provider"), url.searchParams.get("model"))
         return HttpServerResponse.jsonUnsafe({
           ok: true,
           enabled: LarpcodeAbliterated.enabled(),
           custom: LarpcodeAbliterated.custom(),
-          content: LarpcodeAbliterated.content(),
+          selection: LarpcodeAbliterated.selection(),
+          profiles: LarpcodeAbliterated.profiles(),
+          active: LarpcodeAbliterated.activeProfile(model),
+          content: LarpcodeAbliterated.content(model),
           default: LarpcodeAbliterated.DefaultContent,
           max: LarpcodeAbliterated.MaxContentLength,
         })
@@ -99,13 +104,18 @@ export const LarpcodeResetLayer = HttpRouter.use((router) =>
         if (parsed._tag === "Failure")
           return HttpServerResponse.jsonUnsafe({ ok: false, error: "invalid JSON body" }, { status: 400 })
         const body = parsed.success
-        const reset = body !== null && typeof body === "object" && "reset" in body && body.reset === true
-        const content =
-          body && typeof body === "object" && "content" in body && typeof body.content === "string"
-            ? body.content
-            : undefined
-        if (!reset && content === undefined)
-          return HttpServerResponse.jsonUnsafe({ ok: false, error: "content or reset is required" }, { status: 400 })
+        const input =
+          body !== null && typeof body === "object" && !Array.isArray(body) ? (body as Record<string, unknown>) : {}
+        const profile = typeof input.profile === "string" ? input.profile : undefined
+        const reset = input.reset === true
+        const content = typeof input.content === "string" ? input.content : undefined
+        if (Number(profile !== undefined) + Number(reset) + Number(content !== undefined) !== 1)
+          return HttpServerResponse.jsonUnsafe(
+            { ok: false, error: "exactly one of profile, content, or reset is required" },
+            { status: 400 },
+          )
+        if (profile !== undefined && !LarpcodeAbliterated.hasProfile(profile))
+          return HttpServerResponse.jsonUnsafe({ ok: false, error: `unknown profile: ${profile}` }, { status: 400 })
         if (content !== undefined && content.length > LarpcodeAbliterated.MaxContentLength)
           return HttpServerResponse.jsonUnsafe(
             { ok: false, error: `content exceeds ${LarpcodeAbliterated.MaxContentLength} characters` },
@@ -113,7 +123,11 @@ export const LarpcodeResetLayer = HttpRouter.use((router) =>
           )
         const result = yield* Effect.result(
           Effect.try({
-            try: () => (reset ? LarpcodeAbliterated.resetContent() : LarpcodeAbliterated.setContent(content ?? "")),
+            try: () => {
+              if (profile !== undefined) LarpcodeAbliterated.setProfile(profile)
+              else if (reset) LarpcodeAbliterated.resetContent()
+              else LarpcodeAbliterated.setContent(content ?? "")
+            },
             catch: (cause) => cause,
           }),
         )
@@ -125,6 +139,8 @@ export const LarpcodeResetLayer = HttpRouter.use((router) =>
         return HttpServerResponse.jsonUnsafe({
           ok: true,
           custom: LarpcodeAbliterated.custom(),
+          selection: LarpcodeAbliterated.selection(),
+          active: LarpcodeAbliterated.activeProfile(),
           length: LarpcodeAbliterated.content().length,
         })
       }),
@@ -133,7 +149,13 @@ export const LarpcodeResetLayer = HttpRouter.use((router) =>
       "GET",
       "/_larpcode/abliterated",
       Effect.gen(function* () {
-        return HttpServerResponse.jsonUnsafe({ ok: true, enabled: LarpcodeAbliterated.enabled() })
+        return HttpServerResponse.jsonUnsafe({
+          ok: true,
+          enabled: LarpcodeAbliterated.enabled(),
+          selection: LarpcodeAbliterated.selection(),
+          profiles: LarpcodeAbliterated.profiles(),
+          active: LarpcodeAbliterated.activeProfile(),
+        })
       }),
     )
     yield* router.add(
@@ -156,6 +178,23 @@ export const LarpcodeResetLayer = HttpRouter.use((router) =>
           )
         }
         return HttpServerResponse.jsonUnsafe({ ok: true, enabled })
+      }),
+    )
+    yield* router.add(
+      "GET",
+      "/_larpcode/free-route",
+      Effect.sync(() =>
+        HttpServerResponse.jsonUnsafe({ ok: true, freeRoute: LarpcodeImpersonateFetch.freeRouteStatus() }),
+      ),
+    )
+    yield* router.add(
+      "POST",
+      "/_larpcode/free-route/retry",
+      Effect.sync(() => {
+        // Clear only the local routing decision. The upstream shared pool is
+        // still authoritative; the next request simply probes it again.
+        LarpcodeImpersonateFetch.clearFreeLimit()
+        return HttpServerResponse.jsonUnsafe({ ok: true, freeRoute: LarpcodeImpersonateFetch.freeRouteStatus() })
       }),
     )
     yield* router.add(
@@ -203,6 +242,10 @@ export const LarpcodeResetLayer = HttpRouter.use((router) =>
         // bucket in production.
         const deep = url.searchParams.get("deep") === "1" || mode === "fresh" || mode === "fast" || mode === "deep"
         const nukeCredentials = url.searchParams.get("nuke-credentials") === "1"
+        // A reset is the user's explicit "try again now" gesture. Drop the
+        // local free-limit cooldown before doing any work so the next model
+        // request probes opencode.ai instead of replaying the cached refusal.
+        LarpcodeImpersonateFetch.clearFreeLimit()
         diagWrite(`[reset] start mode=${mode ?? "default"} deep=${deep}`)
 
         // Database.Service pull is wrapped in Either so a dependency-
@@ -238,7 +281,11 @@ export const LarpcodeResetLayer = HttpRouter.use((router) =>
                      'session.usage.recorded@1'
                    )`,
           )
-          return HttpServerResponse.jsonUnsafe({ ok: true, deep: false })
+          return HttpServerResponse.jsonUnsafe({
+            ok: true,
+            deep: false,
+            freeRoute: LarpcodeImpersonateFetch.freeRouteStatus(),
+          })
         }
 
         // Rotate the local wire fingerprint before touching the DB. If the
@@ -329,8 +376,10 @@ export const LarpcodeResetLayer = HttpRouter.use((router) =>
 
         // Egress rotation last: it is the slow step (~10-30s on a cold Tor
         // start), and it must not prevent the local wipe from being reported.
-        const warp = yield* rotateWarp()
-        diagWrite(`[reset] done warp=${warp.status}`)
+        // `warp` stays as the response key for older renderers; `egress`
+        // names the real route (WARP or Tor) the current build selected.
+        const egress = yield* Effect.promise(() => rotateEgress())
+        diagWrite(`[reset] done egress=${egress.mode}/${egress.status}`)
 
         return HttpServerResponse.jsonUnsafe({
           ok: true,
@@ -342,7 +391,9 @@ export const LarpcodeResetLayer = HttpRouter.use((router) =>
           fingerprint_rotated: true,
           fingerprint_client: fingerprint.clientLabel,
           fingerprint_nonce_prefix: fingerprint.nonce.slice(0, 12),
-          warp,
+          warp: egress,
+          egress,
+          freeRoute: LarpcodeImpersonateFetch.freeRouteStatus(),
         })
       }).pipe(
         // Bulletproof outer guard. ANY uncaught Effect failure or defect
@@ -452,188 +503,3 @@ function rotateFingerprint(): { nonce: string; ua: string; clientLabel: string; 
   }
 }
 
-// Outcome shape kept under its original name (`WarpOutcome`) and JSON key
-// (`warp`) so the renderer fab doesn't need to change. Semantically this is
-// the Tor egress outcome; `mode: "tor"` distinguishes it from the old
-// `mode: "warp"` payloads, but the pill only reads status + ip_before +
-// ip_after so the mode label is informational.
-type WarpOutcome =
-  | { status: "rotated"; mode: "tor"; ip_before: string | null; ip_after: string }
-  | { status: "unverified"; mode: "tor"; ip_before: null; ip_after: string }
-  | { status: "skipped"; reason: string }
-  | { status: "failed"; step: string; error: string; ip_before?: string | null }
-
-// Rotate both identity layers in parallel:
-//   - Tor gives opencode.ai a new exit IP (routed via our SOCKS5 dispatcher
-//     for opencode.ai hosts only).
-//   - WARP gives DIRECT traffic (non-Tor, non-opencode.ai) a new Cloudflare
-//     exit, so browsing + BYOK paths don't keep a residual identity thread.
-// Both rotations go concurrently so the pill latency is max(tor, warp).
-export function rotateWarp(): Effect.Effect<WarpOutcome & { warp_cycle?: WarpCycleOutcome }> {
-  return Effect.promise(async (): Promise<WarpOutcome & { warp_cycle?: WarpCycleOutcome }> => {
-    const [torResult, warpCycle] = await Promise.all([doTorRotation(), doWarpCycle()])
-    // Primary outcome shape stays Tor's — the pill reads status / ip_before /
-    // ip_after and shows "IP X → Y" from those, which should be the Tor exit
-    // (that's what opencode.ai actually SEES for our dispatched traffic).
-    // WARP's rotation data rides along in `warp_cycle`.
-    return { ...finalizeDisplay(torResult), warp_cycle: warpCycle }
-  })
-}
-
-// The pill displays the real outcome. A fabricated "IP X -> Y" pair used to
-// be returned whenever the probe failed or the rotation was skipped, which
-// made a failed reset look successful and hid the reason from the operator.
-// A failed or unverified rotation now renders as exactly that.
-function finalizeDisplay(outcome: WarpOutcome): WarpOutcome {
-  return outcome
-}
-
-// --- Tor rotation (via bundled tor.exe + SIGNAL NEWNYM) ---------------------
-
-async function doTorRotation(): Promise<WarpOutcome> {
-  // Cold-start tor if it isn't up yet. Subsequent resets skip this — tor
-  // runs for the sidecar's whole lifetime, and even past it since we
-  // spawn it detached. First cold start pays ~15-25s for consensus +
-  // circuit bootstrap; reusable across resets after that.
-  const ensured = await ensureTor()
-  if (ensured.status !== "ready") {
-    return { status: "skipped", reason: `tor not ready: ${ensured.reason}` }
-  }
-
-  // Baseline exit IP, through the SOCKS5 proxy (i.e. what opencode.ai
-  // sees RIGHT NOW on outbound inference requests). If this fails we
-  // can still try the rotation — we just report ip_before as null and
-  // mark the outcome `unverified` at the end.
-  const ipBefore = await probeExitIp(15_000)
-
-  // New circuit.
-  const nym = await signalNewNym()
-  if (!nym.ok) {
-    return { status: "failed", step: "newnym", error: nym.response, ip_before: ipBefore }
-  }
-
-  // Tor's control-port SIGNAL NEWNYM queues a new circuit but doesn't
-  // guarantee the NEXT TCP connection uses it. The signal rate-limits
-  // to one every ~10s (MaxCircuitDirtiness default); waiting ~8s plus
-  // dropping the keepalive sockets flushes the old circuit from
-  // undici's pool so the next request opens a fresh tunnel.
-  await new Promise((r) => setTimeout(r, 8_000))
-  await recycleTorPool()
-
-  let ipAfter = await probeExitIp(15_000)
-
-  // Retry on same-IP. Tor occasionally picks the same exit on the next
-  // circuit, especially in low-diversity countries. Send NEWNYM up to
-  // twice more.
-  for (let attempt = 0; attempt < 2 && ipAfter && ipBefore && ipAfter === ipBefore; attempt++) {
-    const retry = await signalNewNym()
-    if (!retry.ok) break
-    await new Promise((r) => setTimeout(r, 8_000))
-    await recycleTorPool()
-    ipAfter = await probeExitIp(15_000)
-  }
-
-  if (!ipAfter) {
-    return { status: "failed", step: "probe-after", error: "could not read tor exit IP", ip_before: ipBefore }
-  }
-  if (!ipBefore) {
-    return { status: "unverified", mode: "tor", ip_before: null, ip_after: ipAfter }
-  }
-  if (ipBefore === ipAfter) {
-    return {
-      status: "failed",
-      step: "same-ip",
-      error: `tor returned the same exit (${ipAfter}) after 3 NEWNYMs`,
-      ip_before: ipBefore,
-    }
-  }
-  return { status: "rotated", mode: "tor", ip_before: ipBefore, ip_after: ipAfter }
-}
-
-// --- WARP rotation (via warp-cli disconnect + rotate-keys + connect) --------
-
-type WarpCycleOutcome =
-  | { status: "rotated"; ip_before: string; ip_after: string }
-  | { status: "same_ip"; ip: string }
-  | { status: "unverified"; ip_before: string | null; ip_after: string | null }
-  | { status: "skipped"; reason: string }
-  | { status: "failed"; step: string; error: string }
-
-const execFileAsync = promisify(execFile)
-
-const WARP_CANDIDATES = [
-  "C:\\Program Files\\Cloudflare\\Cloudflare WARP\\warp-cli.exe",
-  "C:\\Program Files (x86)\\Cloudflare\\Cloudflare WARP\\warp-cli.exe",
-]
-
-function resolveWarpCli(): string | undefined {
-  for (const c of WARP_CANDIDATES) if (existsSync(c)) return c
-  return undefined
-}
-
-// Fetch WARP's assigned egress IP via a DIRECT HTTPS request to 1.1.1.1's
-// trace endpoint. The ua-spoof dispatcher routes `opencode.ai` through Tor
-// but leaves every other host on the direct pool, so this request exits
-// through WARP (or the user's ISP if WARP is off) and reports the IP
-// opencode.ai would see from any non-Tor traffic.
-async function fetchDirectEgressIp(timeoutMs = 4000): Promise<string | null> {
-  const controller = new AbortController()
-  const t = setTimeout(() => controller.abort(), timeoutMs)
-  try {
-    const res = await fetch("https://1.1.1.1/cdn-cgi/trace", { signal: controller.signal })
-    const text = await res.text()
-    const m = /\bip=([0-9a-fA-F:.]+)/.exec(text)
-    return m ? m[1] : null
-  } catch {
-    return null
-  } finally {
-    clearTimeout(t)
-  }
-}
-
-async function doWarpCycle(): Promise<WarpCycleOutcome> {
-  const warp = resolveWarpCli()
-  if (!warp) return { status: "skipped", reason: "warp-cli not installed" }
-
-  const ipBefore = await fetchDirectEgressIp()
-
-  const run = async (step: string, args: string[], tolerate = false): Promise<void> => {
-    try {
-      await execFileAsync(warp, ["--accept-tos", ...args], {
-        windowsHide: true,
-        timeout: 20_000,
-      })
-    } catch (e) {
-      if (!tolerate) throw new Error(`${step}: ${(e as Error).message}`)
-    }
-  }
-
-  try {
-    // disconnect → rotate-keys → connect. This is the sequence that
-    // actually rotates for consumer WARP. `rotate-keys` alone keeps the
-    // same key-material in use because the existing tunnel sockets are
-    // still live; cycling the tunnel forces re-key.
-    await run("disconnect", ["disconnect"], true)
-    await run("rotate-keys", ["tunnel", "rotate-keys"])
-    await run("connect", ["connect"])
-
-    // Wait for the new tunnel to come up + egress to stabilise. WARP's
-    // `connect` returns before the tunnel is fully usable; 4s matches
-    // what the manual test used.
-    await new Promise((r) => setTimeout(r, 4_000))
-
-    const ipAfter = await fetchDirectEgressIp()
-    if (!ipAfter) {
-      return { status: "unverified", ip_before: ipBefore, ip_after: null }
-    }
-    if (!ipBefore) {
-      return { status: "unverified", ip_before: null, ip_after: ipAfter }
-    }
-    if (ipBefore === ipAfter) {
-      return { status: "same_ip", ip: ipAfter }
-    }
-    return { status: "rotated", ip_before: ipBefore, ip_after: ipAfter }
-  } catch (e) {
-    return { status: "failed", step: "warp-cycle", error: (e as Error).message }
-  }
-}

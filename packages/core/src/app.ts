@@ -19,8 +19,25 @@ export function make(input: Partial<Info> = {}): Info {
   }
 }
 
+// opencode.ai only serves the free models to an official OpenCode client whose
+// User-Agent advertises version 1.18.0 or newer. LarpCode's own release version
+// (1.0.0) is older than that gate, so the wire UA reports the upstream protocol
+// version this tree implements instead of the product version. Keep this in
+// sync with the upstream version LarpCode is rebased onto.
+const WIRE_VERSION = "2.3.0"
+const MIN_WIRE_MINOR = 18
+
+function wireVersion(version: string): string {
+  const match = /^(\d+)\.(\d+)/.exec(version)
+  if (!match) return WIRE_VERSION
+  const major = Number(match[1])
+  const minor = Number(match[2])
+  if (major > 1 || (major === 1 && minor >= MIN_WIRE_MINOR)) return version
+  return WIRE_VERSION
+}
+
 export function useragent(app: Info) {
-  return `opencode/${app.channel}/${app.version}/${app.name}`
+  return `opencode/${app.channel}/${wireVersion(app.version)}/${app.name}`
 }
 
 export const layer = (input?: Partial<Info>) => Layer.succeed(Service, make(input))

@@ -2,6 +2,8 @@ import { confirm, intro, log, outro, spinner } from "@clack/prompts"
 import { Service } from "@opencode/client/effect/service"
 import { Global } from "@opencode/util/global"
 import { Effect, FileSystem, Schedule } from "effect"
+import { spawnSync } from "node:child_process"
+import { readFileSync } from "node:fs"
 import path from "node:path"
 import { Commands } from "../commands"
 import { Runtime } from "../../framework/runtime"
@@ -10,6 +12,79 @@ import { RetainedImage } from "../../services/retained-image"
 import { Updater } from "../../services/updater"
 import { handlePromptErrors, prompt, requireInteractive } from "../../ui/prompt"
 import { errorMessage } from "../../util/error"
+
+type StandaloneInstall = {
+  root: string
+  bin: string
+  shim?: string
+}
+
+// The standalone installer owns one directory. Only treat this process as an
+// installed standalone CLI when it runs from that exact location; a downloaded
+// `larpcode.exe` in Downloads must never delete its own folder.
+function standaloneInstall(home: string): StandaloneInstall | undefined {
+  if (process.platform !== "win32") return undefined
+  const local = process.env.LOCALAPPDATA || path.join(home, "AppData", "Local")
+  const root = path.resolve(local, "Programs", "LarpCode CLI")
+  const executable = path.resolve(process.execPath)
+  const bin = path.dirname(executable)
+  if (path.basename(executable).toLowerCase() !== "larpcode.exe") return undefined
+  if (bin.toLowerCase() !== path.resolve(root, "bin").toLowerCase()) return undefined
+  const shim = path.join(home, ".local", "bin", "larpcode.cmd")
+  return { root, bin, shim: isLarpcodeShim(shim) ? shim : undefined }
+}
+
+function isLarpcodeShim(file: string) {
+  try {
+    const content = readFileSync(file, "utf8")
+    return /larpcode\.exe/i.test(content) && /(?:larpcode cli|%localappdata%)/i.test(content)
+  } catch {
+    return false
+  }
+}
+
+function psQuote(value: string) {
+  return `'${value.replaceAll("'", "''")}'`
+}
+
+function standaloneCleanupScript(install: StandaloneInstall) {
+  const bin = psQuote(install.bin)
+  const root = psQuote(install.root)
+  const shim = install.shim ? psQuote(install.shim) : "''"
+  return `
+$ErrorActionPreference = 'SilentlyContinue'
+$path = [Environment]::GetEnvironmentVariable('Path', 'User')
+if ($path) {
+  $target = ${bin}
+  $entries = @($path -split ';' | Where-Object { $_ -and $_.TrimEnd('\\') -ine $target.TrimEnd('\\') })
+  [Environment]::SetEnvironmentVariable('Path', ($entries -join ';'), 'User')
+}
+$shim = ${shim}
+for ($attempt = 0; $attempt -lt 120; $attempt++) {
+  if ($shim) { Remove-Item -LiteralPath $shim -Force }
+  Remove-Item -LiteralPath ${root} -Recurse -Force
+  if (-not (Test-Path -LiteralPath ${root}) -and (-not $shim -or -not (Test-Path -LiteralPath $shim))) { break }
+  Start-Sleep -Milliseconds 250
+}
+`
+}
+
+// Windows cannot delete the running executable. PowerShell's Start-Process
+// launches a hidden helper that outlives us, removes the PATH entry, and
+// retries the shim and install folder until the running image is released.
+// The launching shell exits immediately, so the uninstall command does not
+// block.
+function scheduleStandaloneRemoval(install: StandaloneInstall) {
+  const encoded = Buffer.from(standaloneCleanupScript(install), "utf16le").toString("base64")
+  const inner = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded]
+  const command = `Start-Process -FilePath powershell.exe -ArgumentList @(${inner.map(psQuote).join(", ")}) -WindowStyle Hidden`
+  const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", command], {
+    encoding: "utf8",
+    windowsHide: true,
+  })
+  if (result.error) throw result.error
+  if (result.status !== 0) throw new Error(result.stderr.trim() || `PowerShell exited with ${result.status}`)
+}
 
 export default Runtime.handler(
   Commands.commands.uninstall,
@@ -27,6 +102,7 @@ export default Runtime.handler(
       ? (yield* fs.readDirectory(global.state)).filter((name) => /^service(?:-.*)?\.json$/.test(name))
       : []
     const shell = method === "curl" ? yield* shellConfigs(global.home) : []
+    const standalone = method === "standalone" ? standaloneInstall(global.home) : undefined
 
     log.info(`Installation method: ${method ?? "unknown"}`)
     log.message("The following global files will be removed (shared by LarpCode versions and channels):")
@@ -36,8 +112,13 @@ export default Runtime.handler(
     )
     shell.forEach((file) => log.info(`  Shell PATH: ${file}`))
     if (removal) log.info(`  Package: ${removal.command.join(" ")}`)
-    if (method === "curl" || method === "standalone")
+    if (standalone) {
+      log.info(`  CLI install: ${standalone.root}`)
+      log.info(`  User PATH entry: ${standalone.bin}`)
+      if (standalone.shim) log.info(`  Command shim: ${standalone.shim}`)
+    } else if (method === "curl" || method === "standalone") {
       log.info(`  Binary (manual removal): ${process.execPath}`)
+    }
     if (!method) log.warn("Could not detect the installation method. Remove the installation manually after cleanup.")
 
     if (input.dryRun) {
@@ -113,11 +194,27 @@ export default Runtime.handler(
       log.message("To finish removing the binary, run:")
       log.info(`  rm '${process.execPath.replaceAll("'", "'\\''")}'`)
     }
-    if (method === "standalone") {
-      log.message("To remove the CLI and its PATH entry, run:")
-      log.info(
-        `  powershell -NoProfile -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create((irm https://github.com/Tazmyan/LarpCode/releases/latest/download/install-cli.ps1))) -Uninstall"`,
+    if (method === "standalone" && standalone) {
+      const removalError = yield* Effect.try({
+        try: () => scheduleStandaloneRemoval(standalone),
+        catch: (cause) => cause,
+      }).pipe(
+        Effect.match({
+          onFailure: (cause) => errorMessage(cause),
+          onSuccess: () => undefined,
+        }),
       )
+      if (removalError === undefined) {
+        log.info("The CLI, its PATH entry, and its command shim will be removed when this process exits.")
+      } else {
+        errors.push(`CLI removal: ${removalError}`)
+        log.message("Close every LarpCode window, then remove the CLI manually:")
+        log.info(`  Remove-Item -LiteralPath ${psQuote(standalone.root)} -Recurse -Force`)
+        log.info(`  Remove-Item -LiteralPath ${psQuote(standalone.bin)} -Force`)
+      }
+    } else if (method === "standalone") {
+      log.message("This standalone binary was not installed by install-cli.ps1. Remove it manually:")
+      log.info(`  Remove-Item -LiteralPath ${psQuote(process.execPath)} -Force`)
     }
     if (errors.length) yield* Effect.fail(new Error(errors.join("\n")))
     outro("Done")

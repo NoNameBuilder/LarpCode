@@ -1,5 +1,6 @@
 import type { DesktopMenuAction, DesktopZoomLevel } from "@opencode/app/desktop-menu"
 import type { DesktopNativeBundle } from "@opencode/app/i18n/desktop-native"
+import type { OpenCodeCredentialList } from "../shared/ipc-rpc/credentials"
 import type { StorageSnapshot } from "../shared/ipc-transport"
 import type { WindowBootstrap } from "../shared/window-bootstrap"
 import type {
@@ -23,6 +24,7 @@ export type ElectronAPI = {
   finishFirstLaunchOnboarding(createDefaultProject: boolean): Promise<string | null>
   checkAppExists(appName: string): Promise<boolean>
   resolveAppPath(appName: string): Promise<string | null>
+  listOpenCodeCredentials(): Promise<OpenCodeCredentialList>
   /** The namespaces the preload read before the page ran; `createDesktopStorage` serves each first read from it. */
   getStorageSnapshot(): Promise<StorageSnapshot>
   storeItems(name: string): Promise<{ items: Record<string, string>; revision: number }>

@@ -413,6 +413,11 @@ export function selectInterfaceMounted(state: StartupState) {
   return state.status === "hydrating" || state.status === "fading" || state.status === "revealed"
 }
 
+/** Whether first-launch onboarding finished. Reaching `fading`/`revealed` implies it did. */
+export function selectOnboardingSettled(state: StartupState) {
+  return state.status !== "hydrating" || state.onboardingDone
+}
+
 export function selectSidecar(state: StartupState) {
   return state.status === "failed" || state.status === "disposed" ? undefined : state.sidecar
 }

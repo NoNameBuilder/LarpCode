@@ -24,6 +24,7 @@ const handler = Effect.fn("cli.usage")(function* (input: Runtime.Input<typeof Co
   )
   const limits = usage.data
   const hasLimits = limits !== null && (limits.go !== undefined || limits.budgets.length > 0)
+  const freeRoute = yield* Effect.promise(() => readFreeRoute(server.endpoint.url, Service.headers(server.endpoint)))
   const stats = hasLimits
     ? undefined
     : yield* request(server.endpoint.url, (signal) => {
@@ -39,8 +40,8 @@ const handler = Effect.fn("cli.usage")(function* (input: Runtime.Input<typeof Co
         )
       })
   const output = input.json
-    ? JSON.stringify({ limits, stats: stats ?? null }, null, 2)
-    : renderUsage(limits, stats, {
+    ? JSON.stringify({ limits, stats: stats ?? null, freeRoute: freeRoute ?? null }, null, 2)
+    : renderUsage(limits, stats, freeRoute, {
         days,
         color: process.stdout.isTTY && process.env.NO_COLOR === undefined,
       })
@@ -61,9 +62,59 @@ export default Runtime.handler(Commands.commands.usage, (input) =>
 const barWidth = 24
 const primary = "36"
 
+type FreeRouteStatus = {
+  cooling: boolean
+  until?: number
+  lastLimitAt?: number
+  lastFallback?: { provider: "deepseek" | "pollinations"; at: number }
+}
+
+async function readFreeRoute(base: string, headers: Record<string, string> | undefined) {
+  try {
+    const response = await fetch(new URL("/_larpcode/free-route", base), {
+      headers,
+      signal: AbortSignal.timeout(5_000),
+    })
+    if (!response.ok) return undefined
+    const body = (await response.json()) as { freeRoute?: FreeRouteStatus }
+    return body.freeRoute
+  } catch {
+    return undefined
+  }
+}
+
+function renderFreeRoute(freeRoute: FreeRouteStatus | undefined, color: boolean) {
+  if (!freeRoute) return []
+  const lines = ["", style("FREE ROUTE", "1", color)]
+  if (freeRoute.cooling) {
+    lines.push(
+      `  ${style("opencode.ai", "1", color)}  ${style("refusing right now", "33", color)}  ${cooldownText(
+        freeRoute.until ?? 0,
+      )}`,
+      `  ${style("fallback", "1", color)}     ${
+        freeRoute.lastFallback
+          ? `${freeRoute.lastFallback.provider} · last used ${new Date(freeRoute.lastFallback.at).toLocaleTimeString()}`
+          : "not used yet"
+      }`,
+      `  ${style("this is the shared free pool, not your local usage", "2", color)}`,
+    )
+  } else {
+    lines.push(
+      `  ${style("opencode.ai", "1", color)}  ${style("available", "32", color)}`,
+      `  ${style("fallback", "1", color)}     ${
+        freeRoute.lastFallback
+          ? `${freeRoute.lastFallback.provider} · last used ${new Date(freeRoute.lastFallback.at).toLocaleTimeString()}`
+          : "not used yet"
+      }`,
+    )
+  }
+  return lines
+}
+
 function renderUsage(
   limits: UsageLimitsInfo | null,
   stats: SessionStatsInfo | undefined,
+  freeRoute: FreeRouteStatus | undefined,
   options: { days: number; color: boolean },
 ) {
   const title = limits?.workspace.name ?? limits?.workspace.id ?? "no limits"
@@ -88,9 +139,11 @@ function renderUsage(
     lines.push(
       "",
       `  ${style("no Go allowance or budgets on this workspace", "2", options.color)}`,
-      `  ${style("the free route rotates automatically; models are not gated by a quota", "2", options.color)}`,
+      `  ${style("free models use opencode.ai's shared pool; LarpCode falls back automatically when it refuses", "2", options.color)}`,
     )
   }
+
+  lines.push(...renderFreeRoute(freeRoute, options.color))
 
   if (stats)
     lines.push(
@@ -140,6 +193,11 @@ function resetText(at: number) {
     minute: "2-digit",
   })
   return `${countdown(at)} (${absolute})`
+}
+
+// The free-route window is a local retry hint, not the shared pool's reset.
+function cooldownText(at: number) {
+  return resetText(at).replace(/^resets /, "retries ")
 }
 
 function countdown(at: number) {

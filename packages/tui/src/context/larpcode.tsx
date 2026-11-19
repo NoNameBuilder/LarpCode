@@ -1,17 +1,22 @@
-import { createEffect, on } from "solid-js"
+import { createEffect, on, onCleanup } from "solid-js"
 import { createStore } from "solid-js/store"
 import { createSimpleContext } from "./helper"
 import { useClient } from "./client"
+import { useEvent } from "./event"
+import { useToast } from "../ui/toast"
 import { errorMessage } from "../util/error"
+
+export type LarpcodeEgress = "warp" | "tor"
 
 export type LarpcodeSettings = {
   autoRotate: boolean
   autoRotateMaxPerHour: number
   freeFallback: boolean
   forceTor: boolean
+  egress: LarpcodeEgress
 }
 
-export type LarpcodeSettingKey = "autoRotate" | "freeFallback" | "forceTor"
+export type LarpcodeSettingKey = "autoRotate" | "freeFallback" | "forceTor" | "egress"
 export type LarpcodeSettingSource = "env" | "file" | "default"
 
 export type LarpcodeDependency = {
@@ -23,6 +28,28 @@ export type LarpcodeDependency = {
   hint: string
 }
 
+export type LarpcodeFreeRoute = {
+  cooling: boolean
+  until?: number
+  lastLimitAt?: number
+  lastFallback?: { provider: "deepseek" | "pollinations"; at: number }
+}
+
+const fallbackLabel = (provider: NonNullable<LarpcodeFreeRoute["lastFallback"]>["provider"]) =>
+  provider === "deepseek" ? "DeepSeek" : "Pollinations"
+
+export type LarpcodeProfileScope = "universal" | "model"
+
+export type LarpcodeProfile = {
+  id: string
+  name: string
+  description: string
+  scope: LarpcodeProfileScope
+  match?: string[]
+}
+
+export type LarpcodeProfileInfo = LarpcodeProfile & { length: number }
+
 export type LarpcodePayload = {
   ok: boolean
   settings: LarpcodeSettings
@@ -31,6 +58,9 @@ export type LarpcodePayload = {
   autoJb: {
     enabled: boolean
     custom: boolean
+    selection: string
+    profiles: LarpcodeProfileInfo[]
+    active: LarpcodeProfileInfo
     length: number
     defaultLength: number
     max: number
@@ -41,6 +71,7 @@ export type LarpcodePayload = {
     value?: string
   }
   missing: number
+  freeRoute?: LarpcodeFreeRoute
 }
 
 type State = {
@@ -58,6 +89,8 @@ export const { use: useLarpcode, provider: LarpcodeProvider } = createSimpleCont
   name: "Larpcode",
   init: () => {
     const client = useClient()
+    const event = useEvent()
+    const toast = useToast()
     const [store, setStore] = createStore<State>({ status: "idle", saving: false })
 
     async function call<T>(path: string, init?: RequestInit) {
@@ -113,6 +146,15 @@ export const { use: useLarpcode, provider: LarpcodeProvider } = createSimpleCont
         await refresh()
       })
 
+    const setProfile = (profile: string) =>
+      mutate(async () => {
+        await call("/_larpcode/abliterated/content", {
+          method: "POST",
+          body: JSON.stringify({ profile }),
+        })
+        await refresh()
+      })
+
     const resetInstructions = () =>
       mutate(async () => {
         await call("/_larpcode/abliterated/content", {
@@ -128,6 +170,37 @@ export const { use: useLarpcode, provider: LarpcodeProvider } = createSimpleCont
         await call("/_larpcode/reset-limits", { method: "POST" })
         await refresh()
       })
+
+    const retryFreeRoute = () =>
+      mutate(async () => {
+        await call("/_larpcode/free-route/retry", { method: "POST" })
+        await refresh()
+      })
+
+    // Fallback routing happens inside the server's fetch override, not in a
+    // session event, so surface the side-channel event while the reply is
+    // rendered. Refreshing the payload keeps the menu's last-fallback row in
+    // sync with the routing state after a refusal.
+    let lastNotice = 0
+    onCleanup(
+      event.on("larpcode.fallback.used", (fallback) => {
+        if (store.data)
+          setStore("data", "freeRoute", {
+            ...(store.data.freeRoute ?? { cooling: false }),
+            lastFallback: { provider: fallback.data.provider, at: fallback.data.at },
+          })
+        void refresh()
+        const now = Date.now()
+        if (now - lastNotice < 10_000) return
+        lastNotice = now
+        toast.show({
+          title: "Fallback in use",
+          message: `opencode.ai refused the free request; this reply is from ${fallbackLabel(fallback.data.provider)}.`,
+          variant: "warning",
+          duration: 8_000,
+        })
+      }),
+    )
 
     // A managed service reconnect can replace the port and password, so refresh
     // against the endpoint that is current now instead of the one first seen.
@@ -150,8 +223,10 @@ export const { use: useLarpcode, provider: LarpcodeProvider } = createSimpleCont
       refresh,
       update,
       setAutoJb,
+      setProfile,
       resetInstructions,
       resetLimits,
+      retryFreeRoute,
     }
   },
 })

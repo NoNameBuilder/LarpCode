@@ -16,11 +16,11 @@
 ; Output:      dist\LarpCode-Setup.exe
 
 #define AppName       "LarpCode"
-; AppVersion: injected by the release workflow via ISCC `/DAppVersion=1.0.0`
+; AppVersion: injected by the release workflow via ISCC `/DAppVersion=1.0.1`
 ; so Add/Remove Programs and the file VersionInfo match the GitHub release tag
-; (`v1.0.0`). The fallback covers local builds that never set it.
+; (`v1.0.1`). The fallback covers local builds that never set it.
 #ifndef AppVersion
-  #define AppVersion "1.0.0"
+  #define AppVersion "1.0.1"
 #endif
 #define AppPublisher  "Tazmyan"
 #define AppURL        "https://github.com/Tazmyan/LarpCode"

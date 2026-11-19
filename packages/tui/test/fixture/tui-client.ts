@@ -136,6 +136,7 @@ export function createFetch(override?: FetchHandler, events?: ReturnType<typeof 
       })
     if (url.pathname === "/api/session") return json({ data: [], cursor: {} })
     if (url.pathname === "/api/config") return json([])
+    if (url.pathname === "/api/credential") return json({ data: [] })
     if (url.pathname === "/api/session/active") return json({ data: {} })
     if (request.method === "POST" && /^\/api\/session\/[^/]+\/model$/.test(url.pathname))
       return new Response(null, { status: 204 })
@@ -168,10 +169,54 @@ export function createFetch(override?: FetchHandler, events?: ReturnType<typeof 
     if (url.pathname === "/_larpcode/settings")
       return json({
         ok: true,
-        settings: { autoRotate: true, autoRotateMaxPerHour: 30, freeFallback: true, forceTor: false },
-        sources: { autoRotate: "default", freeFallback: "default", forceTor: "default" },
+        settings: {
+          autoRotate: true,
+          autoRotateMaxPerHour: 30,
+          freeFallback: true,
+          forceTor: false,
+          egress: "warp",
+        },
+        sources: { autoRotate: "default", freeFallback: "default", forceTor: "default", egress: "default" },
         settingsPath: "/tmp/larpcode-settings.json",
-        autoJb: { enabled: false, custom: false, length: 0, defaultLength: 0, max: 0 },
+        autoJb: {
+          enabled: false,
+          custom: false,
+          selection: "auto",
+          profiles: [
+            {
+              id: "universal",
+              name: "Op Spec",
+              description: "The original universal Auto JB set.",
+              scope: "universal",
+              length: 0,
+            },
+            {
+              id: "bigpickle",
+              name: "Big Pickle",
+              description: "Universal persona set.",
+              scope: "universal",
+              length: 0,
+            },
+            {
+              id: "deepseek",
+              name: "DeepSeek V4.1",
+              description: "Model-specific set for DeepSeek.",
+              scope: "model",
+              match: ["deepseek"],
+              length: 0,
+            },
+          ],
+          active: {
+            id: "universal",
+            name: "Op Spec",
+            description: "The original universal Auto JB set.",
+            scope: "universal",
+            length: 0,
+          },
+          length: 0,
+          defaultLength: 0,
+          max: 0,
+        },
         dependencies: [],
         proxy: { configured: false },
         missing: 0,

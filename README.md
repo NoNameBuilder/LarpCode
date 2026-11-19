@@ -67,7 +67,7 @@ app, or share OpenCode's data.
 
 ```powershell
 $install = irm https://github.com/Tazmyan/LarpCode/releases/latest/download/install-cli.ps1
-& ([scriptblock]::Create($install)) -Version 1.0.0
+& ([scriptblock]::Create($install)) -Version 1.0.1
 ```
 
 </details>
@@ -112,11 +112,19 @@ Useful commands:
 
 ```bat
 larpcode usage       limits, reset times, and local activity graphs
-larpcode usage       limits, reset times, and local activity graphs
 larpcode reset       clear local usage counters (--deep also clears sessions)
 larpcode settings    LarpCode switches, Auto JB, dependencies, and paths
 larpcode doctor      server, database, WARP, Tor, and curl-impersonate
 ```
+
+Free models use opencode.ai's shared anonymous pool. When that pool refuses a
+request and Free fallback is on, LarpCode routes it to a fallback provider
+instead: the configured DeepSeek key when present, otherwise Pollinations
+(`text.pollinations.ai`). The TUI shows a “Fallback in use” notice and records
+the provider in LarpCode settings; `larpcode run` prints the same notice to
+stderr (or a `fallback` event with `--format json`). `larpcode usage` reports
+the current free-route state and the last fallback used. A refusal is the shared
+pool's limit, not a limit on your local usage.
 
 `larpcode doctor` and `larpcode settings` report optional helpers that are not
 installed, including Cloudflare WARP, Tor, and curl-impersonate. They are
@@ -169,7 +177,7 @@ Electron is pinned to `packages/desktop/package.json` and verified against the
 official `SHASUMS256.txt`.
 
 The version comes from the `VERSION` file. A release tag must be `v` plus that
-version (for example `VERSION` = `1.0.0` and tag `v1.0.0`).
+version (for example `VERSION` = `1.0.1` and tag `v1.0.1`).
 
 ## Community
 

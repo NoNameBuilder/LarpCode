@@ -1,6 +1,12 @@
 import { createMemo, createSignal, onMount, Show } from "solid-js"
 import { useNewDesigns } from "../config"
-import { useLarpcode, type LarpcodeDependency, type LarpcodeSettingSource } from "../context/larpcode"
+import {
+  useLarpcode,
+  type LarpcodeDependency,
+  type LarpcodeProfile,
+  type LarpcodeSettingSource,
+} from "../context/larpcode"
+import { useLocal } from "../context/local"
 import { useTheme } from "../context/theme"
 import { DialogHeader, DialogLayout, useDialog } from "../ui/dialog"
 import { DialogConfirm } from "../ui/dialog-confirm"
@@ -28,6 +34,12 @@ const onOff = (value: boolean) => (value ? "on" : "off")
 const sourceNote = (source: LarpcodeSettingSource | undefined) =>
   source === "env" ? " The environment overrides the saved value." : ""
 
+const matchesModel = (profile: LarpcodeProfile, model: { providerID: string; modelID: string } | undefined) => {
+  if (!model || profile.scope !== "model") return false
+  const key = `${model.providerID}/${model.modelID}`.toLowerCase()
+  return profile.match?.some((token) => key.includes(token.toLowerCase())) === true
+}
+
 export function DialogLarpcodeSettings() {
   const larpcode = useLarpcode()
   const dialog = useDialog()
@@ -35,7 +47,26 @@ export function DialogLarpcodeSettings() {
   const theme = useTheme().surface("dialog")
   const newDesigns = useNewDesigns()
   const limits = useUsageLimits()
+  const local = useLocal()
   const [selected, setSelected] = createSignal<string>()
+
+  const model = () => local.model.current()
+  const modelLabel = () => {
+    const current = model()
+    return current ? `${current.providerID}/${current.modelID}` : "the current model"
+  }
+  const matchedProfile = createMemo(() => {
+    const data = larpcode.data()
+    const current = model()
+    if (!data || !current) return undefined
+    return data.autoJb.profiles.find((profile) => matchesModel(profile, current))
+  })
+  const selectedProfile = createMemo(() => {
+    const data = larpcode.data()
+    if (!data) return undefined
+    if (data.autoJb.selection === "auto") return matchedProfile() ?? data.autoJb.active
+    return data.autoJb.profiles.find((profile) => profile.id === data.autoJb.selection) ?? data.autoJb.active
+  })
 
   onMount(() => {
     if (larpcode.status() !== "loading") void larpcode.refresh()
@@ -64,20 +95,47 @@ export function DialogLarpcodeSettings() {
         title: "Auto JB",
         category: "Auto JB",
         value: "autoJb",
-        description: "Inject the abliterated instruction set into every session",
-        keywords: "auto jailbreak abliterated instructions system prompt",
+        description:
+          "When on, every model request carries the selected jailbreak profile instead of the workspace AGENTS.md. When off, no jailbreak is sent.",
+        keywords: "auto jailbreak abliterated instructions system prompt off",
         footer: onOff(data.autoJb.enabled),
         choice: true,
+      },
+      {
+        title: "JB profile",
+        category: "Auto JB",
+        value: "profile",
+        description:
+          data.autoJb.selection === "auto"
+            ? matchedProfile()
+              ? `Automatic: ${matchedProfile()!.name} matches ${modelLabel()}, so that model-specific set is used. Other models fall back to the universal set. Enter to choose.`
+              : `Automatic: no model-specific set matches ${modelLabel()}, so the universal ${data.autoJb.active.name} set is used. Enter to choose a different set.`
+            : `Always uses ${selectedProfile()?.name ?? data.autoJb.selection} (${
+                selectedProfile()?.scope === "model" ? "model-specific" : "universal"
+              } set), even when the model does not match. Enter to choose.`,
+        keywords: "jailbreak profile universal model-specific deepseek big pickle set choice",
+        footer:
+          data.autoJb.selection === "auto"
+            ? matchedProfile()
+              ? `auto · ${matchedProfile()!.name}`
+              : "auto · universal"
+            : (selectedProfile()?.name ?? data.autoJb.selection),
+        choice: true,
+        open: true,
       },
       {
         title: "Instructions",
         category: "Auto JB",
         value: "instructions",
         description: data.autoJb.custom
-          ? `Custom instruction set (${data.autoJb.length.toLocaleString("en-US")} characters). Enter resets to bundled.`
-          : `Bundled instruction set (${data.autoJb.length.toLocaleString("en-US")} characters)`,
-        keywords: "auto jb instructions content reset bundled custom",
-        footer: data.autoJb.custom ? (data.autoJb.length === 0 ? "empty" : "custom") : "default",
+          ? `A custom override (${data.autoJb.length.toLocaleString(
+              "en-US",
+            )} characters) is sent instead of the selected profile. This is Auto JB's prompt text, not OpenCode's instructions setting. Enter to clear it.`
+          : `Using ${selectedProfile()?.name ?? "the selected profile"} (${data.autoJb.length.toLocaleString(
+              "en-US",
+            )} characters). This is Auto JB's prompt text, not OpenCode's instructions setting.`,
+        keywords: "auto jb instructions content reset bundled custom prompt text",
+        footer: data.autoJb.custom ? (data.autoJb.length === 0 ? "empty" : "custom") : "profile",
         choice: true,
         open: true,
       },
@@ -108,13 +166,49 @@ export function DialogLarpcodeSettings() {
         footer: onOff(data.settings.freeFallback),
         choice: true,
       },
+      ...(data.freeRoute?.cooling
+        ? [
+            {
+              title: "Free route",
+              category: "Network",
+              value: "freeRoute",
+              description: `opencode.ai's shared free pool is refusing requests until ${new Date(
+                data.freeRoute.until ?? Date.now(),
+              ).toLocaleTimeString()}. This is not your local usage. Last fallback: ${
+                data.freeRoute.lastFallback?.provider ?? "none yet"
+              }.`,
+              keywords: "free route limit deepseek pollinations fallback shared pool retry",
+              footer: "retry",
+              open: true,
+            },
+          ]
+        : []),
+      ...(data.freeRoute?.lastFallback && !data.freeRoute.cooling
+        ? [
+            {
+              title: "Last fallback",
+              category: "Network",
+              value: "freeRouteLast",
+              description: `The last refused free request was served by ${
+                data.freeRoute.lastFallback.provider === "deepseek" ? "DeepSeek" : "Pollinations"
+              } at ${new Date(
+                data.freeRoute.lastFallback.at,
+              ).toLocaleTimeString()}. opencode.ai's free pool is shared; this is not your local usage.`,
+              keywords: "fallback deepseek pollinations shared pool last used",
+              footer: data.freeRoute.lastFallback.provider,
+            },
+          ]
+        : []),
       {
-        title: "Route through Tor",
+        title: "Egress",
         category: "Network",
-        value: "forceTor",
-        description: `Send opencode.ai traffic through the bundled Tor proxy.${sourceNote(data.sources.forceTor)}`,
-        keywords: "tor proxy socks egress onion",
-        footer: onOff(data.settings.forceTor),
+        value: "egress",
+        description:
+          data.settings.egress === "warp"
+            ? `Rotate and route through Cloudflare WARP. WARP carries the whole system while it is connected.${sourceNote(data.sources.egress)}`
+            : `Rotate and route only LarpCode's opencode.ai traffic through Tor. Other apps keep their normal connection.${sourceNote(data.sources.egress)}`,
+        keywords: "egress route warp tor proxy socks vpn ip",
+        footer: data.settings.egress,
         choice: true,
       },
       {
@@ -188,10 +282,15 @@ export function DialogLarpcodeSettings() {
     const current = data()
     if (!current || !value || larpcode.saving()) return
     try {
+      if (value === "autoJb") return void toggleAutoJb()
+      if (value === "profile") return void cycleProfile(direction)
       if (value === "autoRotate") return void (await larpcode.update({ autoRotate: !current.settings.autoRotate }))
       if (value === "freeFallback")
         return void (await larpcode.update({ freeFallback: !current.settings.freeFallback }))
-      if (value === "forceTor") return void (await larpcode.update({ forceTor: !current.settings.forceTor }))
+      if (value === "egress")
+        return void (
+          await larpcode.update({ egress: current.settings.egress === "warp" ? "tor" : "warp" })
+        )
       if (value === "autoRotateMaxPerHour") {
         const next = Math.min(120, Math.max(1, current.settings.autoRotateMaxPerHour + direction * 5))
         if (next !== current.settings.autoRotateMaxPerHour) await larpcode.update({ autoRotateMaxPerHour: next })
@@ -221,17 +320,83 @@ export function DialogLarpcodeSettings() {
     })
   }
 
+  function profileLabel(id: string) {
+    if (id === "auto") return "Automatic"
+    return data()?.autoJb.profiles.find((profile) => profile.id === id)?.name ?? id
+  }
+
+  async function chooseProfile(next: string) {
+    const current = data()
+    if (!current || larpcode.saving() || next === current.autoJb.selection) return
+    try {
+      await larpcode.setProfile(next)
+      toast.show({ message: `Auto JB profile: ${profileLabel(next)}`, variant: "success" })
+    } catch (error) {
+      toast.error(error)
+    }
+  }
+
+  async function cycleProfile(direction: number) {
+    const current = data()
+    if (!current || larpcode.saving()) return
+    const values = ["auto", ...current.autoJb.profiles.map((profile) => profile.id)]
+    const index = values.indexOf(current.autoJb.selection)
+    const next = values[(index + direction + values.length) % values.length]
+    if (next) await chooseProfile(next)
+  }
+
+  function openProfilePicker() {
+    const current = data()
+    if (!current) return
+    const matched = matchedProfile()
+    const options = [
+      {
+        value: "auto",
+        title: "Automatic",
+        description: matched
+          ? `Use ${matched.name} for ${modelLabel()} and the universal fallback for other models.`
+          : `Use a model-specific set when one matches the model, otherwise the universal fallback. No model-specific set matches ${modelLabel()} right now.`,
+        searchText: "automatic match model default recommended",
+        footer: matched ? `now: ${matched.name}` : "universal",
+      },
+      ...current.autoJb.profiles.map((profile) => ({
+        value: profile.id,
+        title: `${profile.scope === "model" ? "Model-specific" : "Universal"} · ${profile.name}`,
+        description: `${profile.description} (${profile.length.toLocaleString("en-US")} characters)${
+          matchesModel(profile, model()) ? " Matches the current model." : ""
+        }`,
+        searchText: `${profile.name} ${profile.description} ${profile.match?.join(" ") ?? ""}`,
+        footer: matchesModel(profile, model()) ? "matches model" : profile.scope,
+      })),
+    ]
+    dialog.replace(() => (
+      <DialogSelect
+        title="Auto JB profile"
+        searchInTitle
+        titlePlaceholder="Search jailbreak profiles"
+        current={current.autoJb.selection}
+        options={options}
+        onSelect={(option) => {
+          void chooseProfile(option.value).then(() => dialog.replace(() => <DialogLarpcodeSettings />))
+        }}
+      />
+    ))
+  }
+
   function confirmResetInstructions() {
     const current = data()
     if (!current) return
     if (!current.autoJb.custom) {
-      toast.show({ message: "Using the bundled Auto JB instructions", variant: "info" })
+      toast.show({
+        message: `Using ${selectedProfile()?.name ?? "the selected profile"}. Auto JB sends this text; it is not OpenCode's instructions setting.`,
+        variant: "info",
+      })
       return
     }
     dialog.replace(() => (
       <DialogConfirm
         title="Reset Auto JB instructions"
-        message="Replace the custom instruction set with the bundled default?"
+        message="Replace the custom instruction set with the selected profile?"
         label={{ confirm: "Reset", cancel: "Cancel" }}
         onConfirm={() => {
           void larpcode.resetInstructions().then(
@@ -279,6 +444,19 @@ export function DialogLarpcodeSettings() {
       return
     }
     if (value === "autoJb") return void toggleAutoJb()
+    if (value === "profile") return openProfilePicker()
+    if (value === "freeRoute") {
+      try {
+        await larpcode.retryFreeRoute()
+        toast.show({
+          message: "Free route retry queued; the next request will probe opencode.ai again",
+          variant: "success",
+        })
+      } catch (error) {
+        toast.error(error)
+      }
+      return
+    }
     if (value === "instructions") return confirmResetInstructions()
     if (value === "resetUsage") return confirmResetUsage()
     if (value === "recheck") {

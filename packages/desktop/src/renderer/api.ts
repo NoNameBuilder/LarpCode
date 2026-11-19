@@ -28,6 +28,7 @@ export const api: ElectronAPI = {
     invoke("AppFinishFirstLaunchOnboarding", { createDefaultProject }),
   checkAppExists: (appName) => invoke("AppCheckAppExists", { appName }),
   resolveAppPath: (appName) => invoke("AppResolveAppPath", { appName }),
+  listOpenCodeCredentials: () => invoke("CredentialsListOpenCode"),
   getStorageSnapshot: () => window.electron.storageSnapshot,
   storeItems: (name) => invoke("StorageItems", { name }).then(mutable),
   storeUpdate: (name, insert, remove) => invoke("StorageUpdate", { name, insert, remove }),

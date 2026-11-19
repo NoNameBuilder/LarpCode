@@ -12,15 +12,20 @@ export async function createAppFixture(
     width?: number
     height?: number
     state?: string
+    channel?: string
     config?: Config.Info
     args?: TuiInput["args"]
     fetch?: FetchHandler
+    // Seeds the fixture home before the app starts, for features that read user profiles.
+    seedHome?: (home: string) => void
     // A renderer whose owner already set up its terminal, such as the simulation renderer.
     setup?: TestRendererSetup
   } = {},
 ) {
   const { run } = await import("../../src/app")
   const root = await tmpdir()
+  const home = path.join(root.path, "home")
+  input.seedHome?.(home)
   const setup =
     input.setup ??
     (await createTestRenderer({
@@ -38,7 +43,7 @@ export async function createAppFixture(
   const server = Bun.serve({ port: 0, fetch: (request) => calls.fetch(request) })
   const task = Effect.runPromise(
     run({
-      app: { name: "test", version: "test", channel: "test" },
+      app: { name: "test", version: "test", channel: input.channel ?? "test" },
       server: { endpoint: { url: server.url.toString() } },
       config: {
         get: async () => config,
@@ -56,7 +61,7 @@ export async function createAppFixture(
     }).pipe(
       Effect.provide(
         Global.layerWith({
-          home: path.join(root.path, "home"),
+          home,
           data: path.join(root.path, "data"),
           cache: path.join(root.path, "cache"),
           config: path.join(root.path, "config"),

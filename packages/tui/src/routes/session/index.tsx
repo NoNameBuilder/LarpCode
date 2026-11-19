@@ -2441,8 +2441,8 @@ function FreeLimitNotice(props: { message: Pick<SessionMessageAssistant, "error"
   return (
     <box paddingLeft={3} flexDirection="column">
       <text fg={theme.text.muted}>
-        Free usage limit reached.{reset() ? ` It resets at ${reset()}.` : ""} LarpCode rotates the free route
-        automatically, so press Enter to retry.
+        opencode.ai's shared free pool is refusing requests{reset() ? ` until ${reset()}` : ""}. This is not your local
+        usage. Enable Free fallback in LarpCode settings, or press Enter to retry.
       </text>
       <text fg={theme.text.muted}>
         Switch model → <span style={{ fg: theme.text.base }}>/models</span>

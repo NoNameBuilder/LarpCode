@@ -25,6 +25,7 @@ import { ErrorPage } from "@/shell/errors/error"
 import { AppRoutes, File, preloadRoute } from "@/shell/routes/routes"
 import { PluginRoot } from "@/runtime/plugin/root"
 import { LarpcodeResetFab, LarpcodeWebsiteFab } from "@/larpcode-reset-fab"
+import { LarpcodeFreeRoutePill } from "@/larpcode-free-route"
 import { LarpcodeUpdateFab } from "@/larpcode-update-fab"
 import { LarpcodeVersionBadge } from "@/larpcode-version-badge"
 import { LarpcodeThemeFab } from "@/larpcode-theme-fab"
@@ -114,6 +115,7 @@ export function AppInterface(props: {
               <VoiceOverlay />
               <LarpcodeToolbar>
                 <LarpcodeResetFab />
+                <LarpcodeFreeRoutePill />
                 <LarpcodeWebsiteFab />
                 <LarpcodeThemeFab />
                 <LarpcodeUpdateFab />

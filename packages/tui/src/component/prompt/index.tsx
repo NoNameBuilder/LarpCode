@@ -44,7 +44,7 @@ import { errorMessage } from "../../util/error"
 import { createColors, createFrames } from "../../ui/spinner"
 import { useDialog } from "../../ui/dialog"
 import { DialogIntegration } from "../dialog-integration"
-import { useConnected } from "../use-connected"
+import { DialogCredentialImport } from "../dialog-credential-import"
 import { useToast } from "../../ui/toast"
 import { createFadeIn } from "../../util/signal"
 import { DialogSkill } from "../dialog-skill"
@@ -71,6 +71,8 @@ import { useWorkingDirectoryActions } from "../../ui/working-directory-actions"
 import { truncateFilePath } from "../../ui/file-path"
 import { PromptMetadataRow } from "./metadata"
 import { limitLabel, useUsageLimits } from "../usage"
+import { missingModelCredentials } from "../../util/model-credentials"
+import { listOpenCodeCredentials } from "../../util/opencode-import"
 
 export type PromptProps = {
   sessionID?: string
@@ -314,17 +316,23 @@ export function Prompt(props: PromptProps) {
     ],
   }))
   const [cursorVersion, setCursorVersion] = createSignal(0)
-  const connected = useConnected()
 
-  function promptModelWarning() {
+  function promptModelWarning(message = "Connect an integration to send prompts", integrationID?: string) {
     toast.show({
       variant: "warning",
-      message: "Connect an integration to send prompts",
-      duration: 3000,
+      message,
+      duration: 5000,
     })
-    if (!connected()) {
-      dialog.replace(() => <DialogIntegration />)
+    const source = listOpenCodeCredentials({ home: paths.home })
+    // A matching OpenCode sign-in can fix the selected model even when nothing is connected here yet.
+    const credentials = integrationID
+      ? source.credentials.filter((credential) => credential.integrationID === integrationID)
+      : source.credentials
+    if (credentials.length > 0) {
+      dialog.replace(() => <DialogCredentialImport list={{ ...source, credentials }} integrationID={integrationID} />)
+      return
     }
+    dialog.replace(() => <DialogIntegration integrationID={integrationID} />)
   }
 
   function dismissEditorContext() {
@@ -1172,6 +1180,23 @@ export function Prompt(props: PromptProps) {
         variant: "warning",
       })
       return false
+    }
+    if (usesModel) {
+      const location = currentLocation.ref ?? data.location.default()
+      const model = (data.location.model.list(location) ?? []).find(
+        (item) => item.providerID === selection.providerID && item.id === selection.modelID,
+      )
+      const provider = (data.location.provider.list(location) ?? []).find((item) => item.id === selection.providerID)
+      const integration = provider?.integrationID
+        ? (data.location.integration.list(location) ?? []).find((item) => item.id === provider.integrationID)
+        : undefined
+      if (model && missingModelCredentials({ model, provider, integration })) {
+        void promptModelWarning(
+          `${model.name} will not work because no credentials are configured. Import your OpenCode sign-ins or connect an integration.`,
+          provider?.integrationID,
+        )
+        return false
+      }
     }
 
     // Snapshot the composer and clear it synchronously, before the first await.

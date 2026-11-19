@@ -1,11 +1,13 @@
 import { LarpcodeAbliterated } from "@opencode/core/larpcode-abliterated"
+import { ensureEgress } from "@opencode/core/larpcode-egress"
+import * as LarpcodeImpersonateFetch from "@opencode/util/larpcode-impersonate-fetch"
 import { inspect } from "@opencode/util/larpcode-dependencies"
 import * as LarpcodeSettings from "@opencode/util/larpcode-settings"
 import { Effect } from "effect"
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http"
 import { larpcodePreflight } from "./larpcode-reset"
 
-function payload() {
+function payload(model?: LarpcodeAbliterated.ModelRef) {
   const report = inspect()
   return {
     ok: true,
@@ -15,14 +17,22 @@ function payload() {
     autoJb: {
       enabled: LarpcodeAbliterated.enabled(),
       custom: LarpcodeAbliterated.custom(),
-      length: LarpcodeAbliterated.content().length,
+      selection: LarpcodeAbliterated.selection(),
+      profiles: LarpcodeAbliterated.profiles(),
+      active: LarpcodeAbliterated.activeProfile(model),
+      length: LarpcodeAbliterated.content(model).length,
       defaultLength: LarpcodeAbliterated.DefaultContent.length,
       max: LarpcodeAbliterated.MaxContentLength,
     },
     dependencies: report.dependencies,
     proxy: report.proxy,
     missing: report.missing,
+    freeRoute: LarpcodeImpersonateFetch.freeRouteStatus(),
   }
+}
+
+function queryModel(url: URL) {
+  return LarpcodeAbliterated.modelRef(url.searchParams.get("provider"), url.searchParams.get("model"))
 }
 
 export const LarpcodeSettingsLayer = HttpRouter.use((router) =>
@@ -31,7 +41,11 @@ export const LarpcodeSettingsLayer = HttpRouter.use((router) =>
     yield* router.add(
       "GET",
       "/_larpcode/settings",
-      Effect.sync(() => HttpServerResponse.jsonUnsafe(payload())),
+      Effect.gen(function* () {
+        const request = yield* HttpServerRequest.HttpServerRequest
+        const url = new URL(request.url, "http://localhost")
+        return HttpServerResponse.jsonUnsafe(payload(queryModel(url)))
+      }),
     )
     yield* router.add(
       "POST",
@@ -62,6 +76,11 @@ export const LarpcodeSettingsLayer = HttpRouter.use((router) =>
             )
           patch.autoRotateMaxPerHour = input.autoRotateMaxPerHour
         }
+        if ("egress" in input) {
+          if (input.egress !== "warp" && input.egress !== "tor")
+            return HttpServerResponse.jsonUnsafe({ ok: false, error: "egress must be warp or tor" }, { status: 400 })
+          patch.egress = input.egress
+        }
         if (Object.keys(patch).length === 0)
           return HttpServerResponse.jsonUnsafe({ ok: false, error: "no settings supplied" }, { status: 400 })
 
@@ -76,6 +95,15 @@ export const LarpcodeSettingsLayer = HttpRouter.use((router) =>
             { ok: false, error: `could not write settings: ${String(result.failure)}` },
             { status: 500 },
           )
+
+        // Apply the new route without waiting for a restart. `ensureEgress`
+        // removes the Tor fetch router immediately when WARP is selected and
+        // starts Tor when Tor is selected; the response does not block on a
+        // cold Tor start. Failures are already written to larpcode-diag.log.
+        if (patch.egress !== undefined)
+          void ensureEgress().catch((error: unknown) => {
+            console.warn(`[larpcode-settings] egress apply failed: ${String(error)}`)
+          })
 
         return HttpServerResponse.jsonUnsafe(payload())
       }),

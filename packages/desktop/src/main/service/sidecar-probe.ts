@@ -16,7 +16,12 @@ export function startSidecarProbe() {
   const version = CHANNEL === "beta" ? undefined : bundledVersion()
 
   if (version === "") return
-  probe = import("@opencode/client/service").then(({ Service }) => Service.discover({ version })).catch(() => undefined)
+  // The bundled CLI may register under a channel-specific name. Scan the state directory instead
+  // of assuming `service.json`, so a healthy service is adopted at once rather than started twice.
+  const state = process.env.XDG_STATE_HOME ?? path.join(app.getPath("userData"), "xdg", "state")
+  probe = import("@opencode/client/service")
+    .then(({ Service }) => Service.discover({ version, directory: path.join(state, "opencode") }))
+    .catch(() => undefined)
 }
 
 /** The probe's result, once: a later connect must not adopt a service that may have exited since boot. */

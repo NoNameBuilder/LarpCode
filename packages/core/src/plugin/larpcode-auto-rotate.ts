@@ -2,72 +2,37 @@ export * as LarpcodeAutoRotatePlugin from "./larpcode-auto-rotate.js"
 
 import { define } from "@opencode/plugin/effect/plugin"
 import type { SessionHooks } from "@opencode/plugin/effect/session"
-import { findWarp } from "@opencode/util/larpcode-dependencies"
 import * as LarpcodeSettings from "@opencode/util/larpcode-settings"
 import { Effect } from "effect"
-import { spawn } from "node:child_process"
-import { mkdirSync, writeFileSync } from "node:fs"
-import { randomBytes } from "node:crypto"
-import { homedir } from "node:os"
-import { dirname as pathDirname, join as pathJoin } from "node:path"
+import { rotateEgress } from "../larpcode-egress.js"
 
 // LarpCode auto-rotate on opencode.ai quota refusal.
 //
 // On a 429 or 403 from opencode.ai whose body carries a known quota-error
 // signature (FreeUsageLimit, BudgetLimit, GoUsageLimit, "usage limit",
-// "limit reached"), this plugin:
+// "limit reached"), this plugin rotates the configured egress so the next
+// request leaves on a fresh address: a new WARP registration/tunnel, or a new
+// Tor circuit when the user selected Tor.
 //
-//   1. rotates the WARP registration so the next request leaves on a fresh
-//      Cloudflare egress IP (per-IP anonymous bucket resets),
-//   2. stamps a fresh fingerprint file so the ua-spoof plugin derives new
-//      wire ids for every session / project / client / UA header the next
-//      request ships (per-identity bucket resets, from the server's view).
+// It deliberately does not touch session ids, project ids, client labels, or
+// User-Agent values: opencode.ai's free gateway rejects non-official request
+// shapes with a synthetic `FreeUsageLimitError`, so rotating those values
+// causes the refusals instead of clearing them.
 //
 // The current request's error still bubbles to the user — the AI SDK's
-// retry logic doesn't retry 503s on quota-exceeded, and holding the
-// response open past Cloudflare's edge timeout breaks worse than letting
-// the one request fail cleanly. By the time the user retries (even a
-// second later) WARP is on a new identity with a new counter and the wire
-// fingerprint is new, so the retry just works. Matches the standard
-// "automatic WARP rotation on 429" pattern used by external proxies like
-// opencode-infinite-proxy.
+// retry logic doesn't retry quota errors, and holding the response open past
+// Cloudflare's edge timeout breaks worse than letting the one request fail
+// cleanly. The rotation helper always leaves the selected tunnel connected, so
+// the retry lands on the new identity.
 //
 // Toggles (persisted in larpcode-settings.json, environment wins):
 //   autoRotate=false  disable (default ON — LarpCode keeps the free route
-//     usable by rotating the WARP identity and wire fingerprint when a quota
-//     refusal lands; the Reset pill remains the manual trigger).
+//     usable by rotating the selected egress when a quota refusal lands; the
+//     Reset pill remains the manual trigger).
+//   egress=warp|tor  choose Cloudflare WARP (system-wide) or Tor (only
+//     opencode.ai traffic). Default is WARP.
 //   LARPCODE_AUTO_ROTATE=0 / LARPCODE_AUTO_ROTATE_MAX_PER_HOUR=<n>
 //     environment overrides. Hitting the hourly cap lets the 429 pass through.
-
-function fingerprintPath(): string {
-  const data = process.env.XDG_DATA_HOME || pathJoin(homedir(), ".local", "share")
-  return pathJoin(data, "opencode", "larpcode-fingerprint.json")
-}
-
-// Keep in sync with the reset handler's pool so manual-reset-UA and auto-
-// rotate-UA come from the same distribution.
-const UA_POOL = [
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0",
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:132.0) Gecko/20100101 Firefox/132.0",
-] as const
-
-function rotateFingerprintFile(): void {
-  try {
-    const nonce = randomBytes(32).toString("hex")
-    const uaIdx = randomBytes(1)[0] % UA_POOL.length
-    const ua = UA_POOL[uaIdx]
-    const clientLabel = "oc-" + randomBytes(6).toString("hex")
-    const file = fingerprintPath()
-    mkdirSync(pathDirname(file), { recursive: true })
-    writeFileSync(file, JSON.stringify({ nonce, ua, clientLabel, stamped: Date.now() }), { encoding: "utf8" })
-  } catch {
-    /* non-fatal; next request keeps using the previous fingerprint */
-  }
-}
 
 const rotationHistory: number[] = []
 let rotationInFlight: Promise<void> | undefined
@@ -80,33 +45,22 @@ function allowRotation(maxPerHour: number): boolean {
 
 function doRotation(): Promise<void> {
   if (rotationInFlight) return rotationInFlight
-  rotationInFlight = new Promise<void>((resolve) => {
-    rotationHistory.push(Date.now())
-    // Fingerprint first (cheap, always safe) then WARP (slower, system-
-    // level). Order doesn't matter for correctness but writing the file
-    // first means that if WARP hangs we still stamped the new identifier.
-    rotateFingerprintFile()
-    const warp = findWarp()
-    if (!warp) {
-      resolve()
-      return
-    }
-    const run = (args: string[]) =>
-      new Promise<void>((done) => {
-        const c = spawn(warp, args, { stdio: "ignore", windowsHide: true })
-        c.on("exit", () => done())
-        c.on("error", () => done())
-        setTimeout(done, 4000)
-      })
-    ;(async () => {
-      await run(["--accept-tos", "registration", "delete"])
-      await run(["--accept-tos", "registration", "new"])
-      await new Promise((r) => setTimeout(r, 1500))
-      resolve()
-    })()
-  }).finally(() => {
-    rotationInFlight = undefined
-  })
+  rotationHistory.push(Date.now())
+  rotationInFlight = rotateEgress()
+    .then((outcome) => {
+      // rotateEgress writes every step to larpcode-diag.log. Surface the
+      // terminal state on stderr so a packaged build still leaves a trail in
+      // the sidecar log when the diag file cannot be written.
+      if (outcome.status === "failed" || outcome.status === "skipped") {
+        console.warn(`[larpcode-auto-rotate] ${outcome.mode} ${outcome.status}: ${JSON.stringify(outcome)}`)
+      }
+    })
+    .catch((error: unknown) => {
+      console.warn(`[larpcode-auto-rotate] rotation threw: ${String(error)}`)
+    })
+    .finally(() => {
+      rotationInFlight = undefined
+    })
   return rotationInFlight
 }
 
@@ -133,11 +87,6 @@ const QUOTA_BODY = /FreeUsageLimit|BudgetLimit|GoUsageLimit|usage limit|limit re
 export const Plugin = define({
   id: "larpcode.auto-rotate",
   effect: Effect.fn("LarpcodeAutoRotatePlugin")(function* (ctx) {
-    // Even without WARP installed we still rotate the fingerprint — a fresh
-    // wire identity alone resets the per-identity bucket on opencode.ai's
-    // side, which recovers one of the two limit classes (session-keyed).
-    // The per-IP class still bites until warp-cli is present.
-
     const hook = (event: SessionHooks["http.response"]) =>
       Effect.gen(function* () {
         if (!isOpencodeURL(event.request.url)) return

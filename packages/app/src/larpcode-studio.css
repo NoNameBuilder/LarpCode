@@ -108,6 +108,7 @@ body {
   font-size: 12px;
 }
 .oc-toolbar > [data-slot="larpcode-reset-pill"],
+.oc-toolbar > [data-slot="larpcode-free-route-pill"],
 .oc-toolbar > [data-slot="larpcode-website-pill"],
 .oc-toolbar > .oc-update-wrap {
   position: relative;
@@ -117,6 +118,7 @@ body {
   margin: 0;
 }
 .oc-toolbar [data-slot="larpcode-reset-pill"],
+.oc-toolbar [data-slot="larpcode-free-route-pill"],
 .oc-toolbar [data-slot="larpcode-website-pill"],
 .oc-toolbar [data-slot="larpcode-update-pill"],
 .oc-theme-trigger {
@@ -129,6 +131,7 @@ body {
   color: var(--kit-text-muted);
 }
 .oc-toolbar [data-slot="larpcode-reset-pill"]:hover,
+.oc-toolbar [data-slot="larpcode-free-route-pill"]:hover,
 .oc-toolbar [data-slot="larpcode-website-pill"]:hover,
 .oc-theme-trigger:hover {
   background: var(--kit-bg-layer-02);

@@ -181,7 +181,7 @@ function isOpencodeHost(hostname: string | undefined): boolean {
 // Convert a Headers / plain-object / entries-iterable into a flat
 // [key, value] list. We avoid Headers#entries() iteration semantics bugs by
 // doing the normalisation ourselves — some runtimes drop duplicate keys.
-function toHeaderPairs(h: HeadersInit | undefined): [string, string][] {
+function toHeaderPairs(h: unknown): [string, string][] {
   if (!h) return []
   if (h instanceof Headers) {
     const out: [string, string][] = []
@@ -194,7 +194,7 @@ function toHeaderPairs(h: HeadersInit | undefined): [string, string][] {
 
 // Read a body (ReadableStream | Buffer | string | undefined) into a Buffer
 // we can hand to curl via stdin. Streams are fully consumed first.
-async function bodyToBuffer(body: BodyInit | null | undefined): Promise<Buffer | null> {
+async function bodyToBuffer(body: unknown): Promise<Buffer | null> {
   if (body == null) return null
   if (typeof body === "string") return Buffer.from(body, "utf8")
   if (body instanceof Uint8Array) return Buffer.from(body)
@@ -203,7 +203,7 @@ async function bodyToBuffer(body: BodyInit | null | undefined): Promise<Buffer |
   // Blob / FormData / URLSearchParams / ReadableStream — route through the
   // Response constructor to get a uniform arrayBuffer().
   try {
-    const ab = await new Response(body as BodyInit).arrayBuffer()
+    const ab = await new Response(body as ConstructorParameters<typeof Response>[0]).arrayBuffer()
     return Buffer.from(ab)
   } catch (e) {
     diag(`[impersonate] body coercion failed: ${(e as Error).message}`)
@@ -466,6 +466,30 @@ const textOf = (content: unknown) => {
     .join("\n")
 }
 
+// Auto JB appends its instruction set to the END of the joined system prompt.
+// The compact fallback used to keep only the first 4,000 characters, which
+// dropped the whole block before the fallback model ever saw it. Keep the head
+// of the base prompt plus a compact prefix of the Auto JB block instead.
+const AUTO_JB_OPEN = '<project-agents-md path="builtin://larpcode/AGENTS.md">'
+const AUTO_JB_CLOSE = "</project-agents-md>"
+const AUTO_JB_MAX = 12_000
+const AUTO_JB_BASE_MAX = 1_500
+
+function compactSystem(content: unknown) {
+  const text = textOf(content)
+  const start = text.indexOf(AUTO_JB_OPEN)
+  const end = start === -1 ? -1 : text.indexOf(AUTO_JB_CLOSE, start + AUTO_JB_OPEN.length)
+  if (start === -1 || end === -1) return truncateText(text)
+  const base = text.slice(0, start).trim()
+  const block = text.slice(start + AUTO_JB_OPEN.length, end).trim()
+  return [
+    base ? truncateText(base, AUTO_JB_BASE_MAX) : undefined,
+    `${AUTO_JB_OPEN}\n${truncateText(block, AUTO_JB_MAX)}\n${AUTO_JB_CLOSE}`,
+  ]
+    .filter((value): value is string => Boolean(value))
+    .join("\n\n")
+}
+
 const compactMessage = (message: unknown, max = 4000) => {
   if (!message || typeof message !== "object") return message
   const value = message as Record<string, unknown>
@@ -494,11 +518,7 @@ function compactFallbackMessages(messages: unknown[]) {
   const rest = messages.filter((message) => (message as { role?: unknown } | null)?.role !== "system")
   const tail = rest.slice(-6).map((message) => compactMessage(message))
   if (!system.length) return [directive, ...tail]
-  return [
-    directive,
-    { role: "system", content: truncateText(textOf((system[0] as { content?: unknown }).content)) },
-    ...tail,
-  ]
+  return [directive, { role: "system", content: compactSystem((system[0] as { content?: unknown }).content) }, ...tail]
 }
 
 function compactFallbackTools(tools: unknown) {
@@ -569,14 +589,56 @@ export async function fallbackBody(
 // hold the slot until the stream is consumed.
 let fallbackTail: Promise<void> = Promise.resolve()
 
-// The opencode.ai free bucket is global and stays exhausted for hours once it
-// trips. Retrying it before every model step adds a full round trip to each
-// step (and another for the title request), which is most of the "slow to
-// respond" feeling. After the first 429, route chat completions straight to
-// the fallback until the advertised Retry-After, clamped to a sane window.
-const FREE_LIMIT_DEFAULT_MS = 10 * 60_000
-const FREE_LIMIT_MAX_MS = 30 * 60_000
+// The opencode.ai free bucket is shared and can refuse requests even when this
+// install has not used it. The advertised Retry-After (often 1800s) is the
+// upstream pool's hint, not a promise that this user's own quota is gone. A
+// half-hour client lockout made the free model look permanently limited after
+// one refusal, so cap the routing cooldown and expose a manual clear. Retrying
+// sooner is cheap: a refusal costs one request and immediately falls back.
+const FREE_LIMIT_DEFAULT_MS = 60_000
+const FREE_LIMIT_MAX_MS = 5 * 60_000
+const FREE_LIMIT_MIN_MS = 30_000
 let freeLimitUntil = 0
+let lastFreeLimitAt = 0
+let lastFallback: { provider: FreeRouteFallback; at: number } | undefined
+
+export type FreeRouteFallback = "deepseek" | "pollinations"
+export type FreeRouteStatus = {
+  cooling: boolean
+  until?: number
+  lastLimitAt?: number
+  lastFallback?: { provider: FreeRouteFallback; at: number }
+}
+
+// The server process registers a listener here and forwards each fallback to
+// the event bus, so the TUI and CLI can show that the reply came from a
+// fallback provider without this util module depending on core/server.
+export type FallbackUsed = { provider: FreeRouteFallback; at: number }
+const fallbackListeners = new Set<(fallback: FallbackUsed) => void>()
+
+export function onFallbackUsed(listener: (fallback: FallbackUsed) => void): () => void {
+  fallbackListeners.add(listener)
+  return () => fallbackListeners.delete(listener)
+}
+
+export function freeRouteStatus(): FreeRouteStatus {
+  return {
+    cooling: freeLimitCooling(),
+    ...(freeLimitUntil > 0 ? { until: freeLimitUntil } : {}),
+    ...(lastFreeLimitAt > 0 ? { lastLimitAt: lastFreeLimitAt } : {}),
+    ...(lastFallback ? { lastFallback: { ...lastFallback } } : {}),
+  }
+}
+
+// The Reset action promises to clear free-limit cooldowns. The bucket itself
+// is server-side, so this only clears the local routing decision and lets the
+// next request probe opencode.ai again.
+export function clearFreeLimit() {
+  freeLimitUntil = 0
+  lastFreeLimitAt = 0
+  lastFallback = undefined
+  diag("[fallback] free-limit cooldown cleared")
+}
 
 function noteFreeLimit(headers: Headers) {
   const raw = headers.get("retry-after")
@@ -587,13 +649,32 @@ function noteFreeLimit(headers: Headers) {
     : Number.isFinite(date)
       ? date - Date.now()
       : FREE_LIMIT_DEFAULT_MS
-  const clamped = Math.min(FREE_LIMIT_MAX_MS, Math.max(60_000, Number.isFinite(wait) ? wait : FREE_LIMIT_DEFAULT_MS))
+  const clamped = Math.min(
+    FREE_LIMIT_MAX_MS,
+    Math.max(FREE_LIMIT_MIN_MS, Number.isFinite(wait) ? wait : FREE_LIMIT_DEFAULT_MS),
+  )
   freeLimitUntil = Date.now() + clamped
+  lastFreeLimitAt = Date.now()
   diag(`[fallback] free-limit cooldown ${Math.round(clamped / 1000)}s`)
 }
 
 function freeLimitCooling() {
   return Date.now() < freeLimitUntil
+}
+
+function tagFallback(response: Response, provider: FreeRouteFallback): Response {
+  const fallback = { provider, at: Date.now() }
+  lastFallback = fallback
+  for (const listener of fallbackListeners) {
+    try {
+      listener({ ...fallback })
+    } catch (error) {
+      diag(`[fallback] listener failed: ${(error as Error).message}`)
+    }
+  }
+  const headers = new Headers(response.headers)
+  headers.set("x-larpcode-fallback", provider)
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers })
 }
 
 function fallbackEnabled() {
@@ -790,7 +871,7 @@ async function fallbackResponse(
           90_000,
         )
         diag(`[fallback] deepseek status=${response.status} type=${response.headers.get("content-type") || "n/a"}`)
-        if (response.ok) return response
+        if (response.ok) return tagFallback(response, "deepseek")
         await response.body?.cancel()
       } catch (e) {
         diag(`[fallback] deepseek failed: ${(e as Error).message}`)
@@ -814,19 +895,19 @@ async function fallbackResponse(
         diag(
           `[fallback] response status=${response.status} type=${response.headers.get("content-type") || "n/a"} attempt=${attempt + 1}`,
         )
-        if (response.status !== 429) return holdFallbackSlot(response, release)
+        if (response.status !== 429) return tagFallback(holdFallbackSlot(response, release), "pollinations")
         lastStatus = response.status
         lastHeaders = response.headers
         lastText = await response.text()
         if (!busyFallbackBody(lastText)) {
           release()
-          return new Response(lastText, { status: lastStatus, headers: lastHeaders })
+          return tagFallback(new Response(lastText, { status: lastStatus, headers: lastHeaders }), "pollinations")
         }
         diag(`[fallback] classic slot busy; waiting (attempt=${attempt + 1})`)
         if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, 1500 * (attempt + 1)))
       }
       release()
-      return new Response(lastText, { status: lastStatus, headers: lastHeaders })
+      return tagFallback(new Response(lastText, { status: lastStatus, headers: lastHeaders }), "pollinations")
     })
   } catch (e) {
     diag(`[fallback] failed: ${(e as Error).message}`)
@@ -1228,6 +1309,16 @@ async function impersonateFetchViaSubprocess(
 // curl-impersonate, leaving every other host on the native fetch. Idempotent:
 // a second install call is a no-op, so tests unhook by restoring the saved
 // global and clearing `__larpcodeImpersonateInstalled`.
+export function uninstallImpersonateFetchOverride(): { removed: boolean } {
+  if (!(globalThis as { __larpcodeImpersonateInstalled?: boolean }).__larpcodeImpersonateInstalled) {
+    return { removed: false }
+  }
+  ;(globalThis as { fetch: typeof globalThis.fetch }).fetch = nativeFetch
+  delete (globalThis as { __larpcodeImpersonateInstalled?: boolean }).__larpcodeImpersonateInstalled
+  diag("[impersonate] fetch override removed")
+  return { removed: true }
+}
+
 export function installImpersonateFetchOverride(): { installed: boolean; reason?: string } {
   const bin = resolveImpersonateBin()
   if ((globalThis as { __larpcodeImpersonateInstalled?: boolean }).__larpcodeImpersonateInstalled) {
@@ -1238,21 +1329,21 @@ export function installImpersonateFetchOverride(): { installed: boolean; reason?
   }
   nativeFetch = globalThis.fetch.bind(globalThis)
   ;(globalThis as { fetch: typeof globalThis.fetch }).fetch = (async (
-    input: RequestInfo | URL,
+    input: string | URL | Request,
     init?: RequestInit,
   ): Promise<Response> => {
     try {
       const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url
       const host = new URL(url).hostname.toLowerCase()
       if (!isOpencodeHost(host)) {
-        return nativeFetch(input as RequestInfo | URL, init)
+        return nativeFetch(input, init)
       }
       const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase()
       const headerPairs = toHeaderPairs(init?.headers ?? (input instanceof Request ? input.headers : undefined))
       const bodySource =
         init?.body ??
         (input instanceof Request && method !== "GET" && method !== "HEAD" ? await input.clone().arrayBuffer() : null)
-      const bodyBuf = await bodyToBuffer(bodySource as BodyInit | null)
+      const bodyBuf = await bodyToBuffer(bodySource)
       // curl-impersonate is the TLS-fingerprint path, not a prerequisite for
       // sending the request. Without it, send natively and still inspect the
       // response so a free-limit refusal can switch providers.
@@ -1279,7 +1370,7 @@ export function installImpersonateFetchOverride(): { installed: boolean; reason?
       return await fallbackForResponse(null, url, bodyBuf, response)
     } catch (e) {
       diag(`[impersonate] fetch override ERROR, falling through to native: ${(e as Error).message}`)
-      return nativeFetch(input as RequestInfo | URL, init)
+      return nativeFetch(input, init)
     }
   }) as typeof globalThis.fetch
   ;(globalThis as { __larpcodeImpersonateInstalled?: boolean }).__larpcodeImpersonateInstalled = true

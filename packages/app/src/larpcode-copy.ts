@@ -49,4 +49,14 @@ export const LARPCODE_COPY = {
   "user.appearance.tagline.mint": "Fresh perspective",
   "user.appearance.tagline.lavender": "Gentle, not grey",
   "user.appearance.tagline.sand": "Sunlit terracotta",
+
+  "settings.larpcode.section": "LarpCode",
+  "settings.larpcode.egress.title": "Egress",
+  "settings.larpcode.egress.description.warp":
+    "Rotate through Cloudflare WARP. WARP carries the whole system while it is connected.",
+  "settings.larpcode.egress.description.tor":
+    "Rotate only LarpCode’s opencode.ai traffic through Tor. Other apps keep their normal connection.",
+  "settings.larpcode.egress.warp": "Cloudflare WARP",
+  "settings.larpcode.egress.tor": "Tor",
+  "settings.larpcode.egress.unavailable": "Egress settings are unavailable on this server.",
 } as const

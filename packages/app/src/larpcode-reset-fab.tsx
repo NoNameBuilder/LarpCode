@@ -124,6 +124,7 @@ export function LarpcodeResetFab() {
             ok?: boolean
             warp?: {
               status?: string
+              mode?: string
               ip_before?: string | null
               ip_after?: string
               reason?: string
@@ -148,6 +149,8 @@ export function LarpcodeResetFab() {
           const bits: string[] = []
           if (warp?.status === "rotated" && warp.ip_after) {
             bits.push(`IP ${warp.ip_before ?? "?"} → ${warp.ip_after}`)
+          } else if (warp?.status === "same_ip" && warp.ip_after) {
+            bits.push(`Egress IP unchanged: ${warp.ip_after}`)
           } else if (warp?.status === "unverified" && warp.ip_after) {
             bits.push(`IP unverified (now ${warp.ip_after})`)
           } else if (warp?.status === "skipped") {

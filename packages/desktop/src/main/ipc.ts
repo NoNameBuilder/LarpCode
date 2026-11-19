@@ -8,6 +8,7 @@ import { DragCancelEvent, IpcTransportPort } from "../shared/ipc-transport"
 import { Plugins } from "./plugin"
 import { DesktopFiles, openExternalURL } from "./files"
 import { appHandlers } from "./ipc-handlers/app"
+import { credentialHandlers } from "./ipc-handlers/credentials"
 import { eventHandlers } from "./ipc-handlers/events"
 import { pluginHandlers } from "./ipc-handlers/plugins"
 import { fileHandlers } from "./ipc-handlers/files"
@@ -28,6 +29,7 @@ const services = Layer.mergeAll(DesktopFiles.layer, Plugins.layer)
 
 const handlers = Layer.mergeAll(
   appHandlers,
+  credentialHandlers,
   storageHandlers,
   fileHandlers,
   windowHandlers,

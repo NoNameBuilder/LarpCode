@@ -1774,9 +1774,9 @@ test("free usage limit shows an inline retry notice and keeps the composer usabl
     durable: { aggregateID: session.id, seq: 1, version: 1 },
     data: { sessionID: session.id, assistantMessageID: "msg_free_assistant", error },
   })
-  await setup.waitForFrame((frame) => frame.includes("LarpCode rotates the free route"))
-  const frame = setup.captureCharFrame()
-  expect(frame).toContain("Free usage limit reached.")
+  await setup.waitForFrame((frame) => frame.includes("shared free pool is refusing"))
+  const frame = setup.captureCharFrame().replace(/\s+/g, " ")
+  expect(frame).toContain("This is not your local usage")
   expect(frame).toContain("Switch model → /models")
   expect(frame).not.toContain("OpenCode Go")
   expect(frame).not.toContain("Free limit reached")
@@ -1876,12 +1876,12 @@ test("free usage limit notice never opens a modal or overwrites a typing draft a
   first.events.emit(event)
   second.events.emit(event)
   await Promise.all([
-    first.waitForFrame((frame) => frame.includes("LarpCode rotates the free route")),
-    second.waitForFrame((frame) => frame.includes("LarpCode rotates the free route")),
+    first.waitForFrame((frame) => frame.includes("shared free pool is refusing")),
+    second.waitForFrame((frame) => frame.includes("shared free pool is refusing")),
   ])
   for (const instance of [first, second]) {
-    const frame = instance.captureCharFrame()
-    expect(frame).toContain("Free usage limit reached.")
+    const frame = instance.captureCharFrame().replace(/\s+/g, " ")
+    expect(frame).toContain("This is not your local usage")
     expect(frame).not.toContain("Free limit reached")
     expect(frame).not.toContain("OpenCode Go")
   }
@@ -1901,7 +1901,7 @@ test("free usage limit notice never opens a modal or overwrites a typing draft a
   await typing.mockInput.typeText("Draft in progress")
   await typing.waitForFrame((frame) => frame.includes("Draft in progress"))
   typing.events.emit(event)
-  await typing.waitForFrame((frame) => frame.includes("LarpCode rotates the free route"))
+  await typing.waitForFrame((frame) => frame.includes("shared free pool is refusing"))
   const frame = typing.captureCharFrame()
   expect(frame).toContain("Draft in progress")
   expect(frame.split("Refactor the parser").length).toBe(2)

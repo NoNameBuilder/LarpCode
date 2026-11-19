@@ -47,6 +47,8 @@ import { CorsConfig } from "./cors"
 import { handlers } from "./handlers"
 import { LarpcodeResetLayer } from "./handlers/larpcode-reset"
 import { LarpcodeSettingsLayer } from "./handlers/larpcode-settings"
+import { LarpcodeEvent } from "@opencode/schema/larpcode-event"
+import * as LarpcodeImpersonateFetch from "@opencode/util/larpcode-impersonate-fetch"
 import { authorizationLayer } from "./middleware/authorization"
 import { schemaErrorLayer } from "./middleware/schema-error"
 import { ServerPairing } from "./pairing"
@@ -180,6 +182,7 @@ function makeRoutes<AuthError, AuthServices>(
   return serviceLayer.pipe(
     Layer.flatMap((context) => {
       const services = Layer.succeedContext(context)
+      const bus = Context.get(context, Bus.Service)
       const requestServices = Layer.merge(
         Layer.succeedContext(
           Context.pick(
@@ -197,6 +200,20 @@ function makeRoutes<AuthError, AuthServices>(
         HttpApiBuilder.layer(Api, { openapiPath: "/openapi.json" }),
         LarpcodeResetLayer,
         LarpcodeSettingsLayer,
+        // LarpCode: the fetch override is plain async code, so it reports a
+        // fallback through this listener and the route graph forwards it to
+        // connected TUI/CLI clients. Scoped so rebuilding routes replaces the
+        // listener instead of stacking duplicates.
+        Layer.effectDiscard(
+          Effect.acquireRelease(
+            Effect.sync(() =>
+              LarpcodeImpersonateFetch.onFallbackUsed((fallback) => {
+                Effect.runFork(bus.publish(LarpcodeEvent.FallbackUsed, fallback))
+              }),
+            ),
+            (unsubscribe) => Effect.sync(unsubscribe),
+          ),
+        ),
       ).pipe(
         Layer.provide(handlers.pipe(Layer.provide(services), Layer.provide(Layer.succeed(CorsConfig, options)))),
         Layer.provide(formLocationLayer),

@@ -19,6 +19,7 @@ import { useTheme } from "@opencode/ui/theme/context"
 import type { BaseRouterProps } from "@solidjs/router"
 import { createEffect, createMemo, createSignal, lazy, onCleanup, Show, Suspense, untrack } from "solid-js"
 import type { ElectronAPI } from "./api-types"
+import { DesktopCredentialImport } from "./credential-import-driver"
 import { DesktopFirstLaunchOnboarding } from "./onboarding"
 import { createDesktopPlatform } from "./platform"
 import { bindDesktopMenu } from "./platform/menu"
@@ -32,6 +33,7 @@ import {
   selectInterfaceMounted,
   selectOverlayFading,
   selectOverlayMounted,
+  selectOnboardingSettled,
   selectSidecar,
   selectSplashDeep,
   selectStartupFailure,
@@ -122,6 +124,11 @@ export function DesktopApp(props: { api: ElectronAPI; version: string }) {
               pending={selectFirstLaunch(startup.state())}
               revealed={selectStartupRevealed(startup.state())}
               dispatch={startup.dispatch}
+            />
+            <DesktopCredentialImport
+              api={props.api}
+              platform={platform}
+              onboardingSettled={selectOnboardingSettled(startup.state())}
             />
             <DesktopEffects api={props.api} />
             <Suspense fallback={null}>
@@ -283,8 +290,7 @@ function DesktopEffects(props: { api: ElectronAPI }) {
     // `useTheme()` is the vendor context, so the Clear kit's id carries its
     // `larpcode-` prefix here.
     const base = getComputedStyle(document.documentElement).getPropertyValue("--background-base").trim()
-    const background =
-      theme.themeId() === "larpcode-clear" || !base || base === "transparent" ? "#00000000" : base
+    const background = theme.themeId() === "larpcode-clear" || !base || base === "transparent" ? "#00000000" : base
 
     if (background) void props.api.setBackgroundColor(background)
   })

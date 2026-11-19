@@ -1,10 +1,11 @@
 import { Effect, FileSystem, Option, Schedule, Schema } from "effect"
+import { join } from "node:path"
 import type { DiscoverOptions, EnsureOptions, StopOptions } from "../service.js"
 import { contenderPool, spawnServiceContender } from "../service-contender.js"
 import { defaultEnsureTiming, ensureTiming, type EnsureTiming } from "../service-timing.js"
 import { matchesVersion } from "../service-version.js"
 import { PtyHandoff } from "../pty-handoff.js"
-import { decide, fallback, headers, probeResult, same } from "../service-probe.js"
+import { decide, fallback, headers, probeResult, same, type LocalService } from "../service-probe.js"
 
 export * from "../service.js"
 export { headers }
@@ -23,10 +24,13 @@ export type Info = typeof Info.Type
 // Never spawns; escalation to ensure() is the caller's policy.
 /** Discover a healthy, compatible local service without starting one. */
 export const discover = Effect.fn("service.discover")(function* (options: DiscoverOptions = {}) {
-  const found = (yield* registered(options.file)).service
-  if (found?.state !== "ready") return undefined
-  if (!found.compatible) return undefined
-  if (!matchesVersion(found.version, options)) return undefined
+  const found = (yield* registrations(options)).find(
+    (entry) =>
+      entry.service?.state === "ready" &&
+      entry.service.compatible &&
+      matchesVersion(entry.service.version, options),
+  )?.service
+  if (found === undefined) return undefined
   return found.endpoint
 })
 
@@ -51,6 +55,9 @@ export const ensure = Effect.fn("service.ensure")(function* (options: EnsureOpti
   const pool = contenderPool(timing)
   let timeouts: { readonly info: Info; readonly count: number } | undefined
   let announced = false
+  // Persistent-terminal handoff tickets sit next to the registration that produced them, so spawning
+  // must read the same channel-specific file this client last matched.
+  let handoff = options.file ?? fallback()
   const announce = (reason: "missing" | "version-mismatch", previousVersion?: string) =>
     Effect.sync(() => {
       if (announced) return
@@ -60,7 +67,7 @@ export const ensure = Effect.fn("service.ensure")(function* (options: EnsureOpti
   const spawnContender = Effect.gen(function* () {
     const [command, ...args] = options.command ?? ["opencode", "serve", "--service"]
     if (command === undefined) return yield* Effect.fail(new Error("Missing service command"))
-    const env = yield* Effect.tryPromise(() => PtyHandoff.environment(options.file ?? fallback(), options.env))
+    const env = yield* Effect.tryPromise(() => PtyHandoff.environment(handoff, options.env))
     return yield* Effect.try({
       try: () => {
         return spawnServiceContender(command, args, env)
@@ -69,7 +76,9 @@ export const ensure = Effect.fn("service.ensure")(function* (options: EnsureOpti
     })
   })
   const found = yield* Effect.gen(function* () {
-    const registration = yield* registered(options.file, timing.requestTimeout)
+    const registration = yield* registered(options, timing.requestTimeout)
+    const file = registration.file ?? handoff
+    if (registration.file !== undefined) handoff = registration.file
     const info = registration.info
     const service = registration.service
     if (registration.timedOut && info !== undefined) {
@@ -80,8 +89,8 @@ export const ensure = Effect.fn("service.ensure")(function* (options: EnsureOpti
       if (timeouts.count >= 3) {
         yield* announce("missing")
         yield* Effect.logWarning("Background service is unresponsive; recovery cannot preserve persistent terminals")
-        yield* Effect.tryPromise(() => PtyHandoff.clear(options.file ?? fallback()))
-        yield* terminate(info, options, timing)
+        yield* Effect.tryPromise(() => PtyHandoff.clear(file))
+        yield* terminate(info, { file }, timing)
         pool.evict(info.pid)
         pool.recruitNow()
         timeouts = undefined
@@ -92,14 +101,14 @@ export const ensure = Effect.fn("service.ensure")(function* (options: EnsureOpti
       const decision = decide(service, options)
       if (decision._tag === "fail") return yield* Effect.fail(decision.error)
       if (decision._tag === "reuse") {
-        yield* Effect.tryPromise(() => PtyHandoff.complete(options.file ?? fallback(), service.info))
+        yield* Effect.tryPromise(() => PtyHandoff.complete(file, service.info))
         return Option.some(service)
       }
       if (decision._tag === "replace") {
         yield* announce("version-mismatch", service.version)
         if (service.state !== "ready")
           yield* Effect.logWarning("Background service is not ready; replacement cannot preserve persistent terminals")
-        yield* stop({ file: options.file, pty: decision.pty }).pipe(Effect.ignore)
+        yield* stop({ file: registration.file, pty: decision.pty }).pipe(Effect.ignore)
         pool.evict(service.info.pid)
       }
       return Option.none()
@@ -157,11 +166,72 @@ const read = Effect.fnUntraced(function* (file?: string) {
   return yield* decode(text.value).pipe(Effect.option, Effect.map(Option.getOrUndefined))
 })
 
-const registered = Effect.fnUntraced(function* (file?: string, timeout?: number) {
-  const info = yield* read(file)
-  if (info === undefined) return { info: undefined, service: undefined, timedOut: false }
-  return { info, ...(yield* Effect.promise(() => probeResult(info, timeout))) }
+const registered = Effect.fnUntraced(function* (options: DiscoverOptions, timeout?: number) {
+  const found = yield* registrations(options, timeout)
+  if (found.length === 0) return { file: undefined, info: undefined, service: undefined, timedOut: false }
+  return found.reduce((best, entry) => (rank(entry, options) > rank(best, options) ? entry : best))
 })
+
+type Registration = {
+  readonly file: string
+  readonly info: Info
+  readonly timedOut: boolean
+  readonly service?: LocalService
+}
+
+/**
+ * Registrations behind every channel-specific name in the directory. A service started by a build
+ * whose channel differs from the client's uses another file (`service-prod.json` versus
+ * `service-local.json`), so the starter must adopt the file that actually appeared.
+ */
+const registrations = Effect.fnUntraced(function* (options: DiscoverOptions, timeout?: number) {
+  const files = yield* candidateFiles(options)
+  const decoded = (
+    yield* Effect.forEach(
+      files,
+      (file) =>
+        read(file).pipe(Effect.map((info) => (info === undefined ? undefined : { file, info }))),
+      { concurrency: "unbounded" },
+    )
+  ).filter((entry): entry is { file: string; info: Info } => entry !== undefined)
+
+  return yield* Effect.forEach(
+    decoded,
+    (entry): Effect.Effect<Registration> =>
+      Effect.promise(() => probeResult(entry.info, timeout)).pipe(Effect.map((result) => ({ ...entry, ...result }))),
+    { concurrency: "unbounded" },
+  )
+})
+
+const candidateFiles = Effect.fnUntraced(function* (options: DiscoverOptions) {
+  const fs = yield* FileSystem.FileSystem
+  const file = options.file ?? fallback()
+  if (options.directory === undefined) return [file]
+  const entries = yield* fs
+    .readDirectory(options.directory)
+    .pipe(Effect.orElseSucceed(() => [] as ReadonlyArray<string>))
+  const files = [file]
+  for (const entry of [...entries].sort()) {
+    if (!entry.startsWith("service") || !entry.endsWith(".json")) continue
+    const candidate = join(options.directory, entry)
+    if (!files.includes(candidate)) files.push(candidate)
+  }
+  return files
+})
+
+/**
+ * Prefer a service that can be reused, then one that must be replaced, then one that is still
+ * starting, and only finally a registration that cannot answer at all.
+ */
+function rank(entry: Registration, options: DiscoverOptions) {
+  if (entry.service === undefined) return 0
+  const { service } = entry
+  if (!service.compatible) return service.state === "ready" ? 1 : 0
+  const matches = matchesVersion(service.version, options)
+  if (service.state === "ready") return matches ? 6 : 5
+  if (service.state === "waiting") return matches ? 4 : 3
+  return matches ? 2 : 1
+}
 
 // 50ms cadence bounded at ~5s, shared by stop escalation and each ensure
 // discovery window.

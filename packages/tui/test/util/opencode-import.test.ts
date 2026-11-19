@@ -2,7 +2,13 @@ import { Database } from "bun:sqlite"
 import { afterEach, describe, expect, test } from "bun:test"
 import { mkdirSync } from "node:fs"
 import path from "node:path"
-import { findOpenCodeDatabases, listOpenCodeSessions, readOpenCodeSession } from "../../src/util/opencode-import"
+import {
+  findOpenCodeDatabases,
+  importOpenCodeCredentials,
+  listOpenCodeCredentials,
+  listOpenCodeSessions,
+  readOpenCodeSession,
+} from "../../src/util/opencode-import"
 import { tmpdir } from "../fixture/fixture"
 
 const hash = "a".repeat(64)
@@ -231,6 +237,20 @@ function writeOpenCodeDatabase(file: string, legacy = false) {
     }),
   )
 
+  const insertCredential = db.query(
+    "INSERT INTO credential (id, integration_id, label, value, active, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?, ?)",
+  )
+  insertCredential.run(
+    "cred_active",
+    "opencode",
+    "Personal",
+    JSON.stringify({ type: "oauth", methodID: "device", refresh: "rt_test", access: "st_test", expires: 100 }),
+    1,
+    1,
+    2,
+  )
+  insertCredential.run("cred_key", "openai", "Work", JSON.stringify({ type: "key", key: "sk-test" }), null, 1, 2)
+
   db.query("INSERT INTO blob VALUES (?, ?, ?)").run(hash, "image/png", new Uint8Array([1, 2, 3]))
   db.close()
 }
@@ -250,6 +270,10 @@ const modernSchema = `
     message_id text, session_id text, type text, ordinal integer, data text
   );
   CREATE TABLE blob (hash text PRIMARY KEY, mime text, data blob);
+  CREATE TABLE credential (
+    id text PRIMARY KEY, integration_id text, label text NOT NULL, value text NOT NULL,
+    connector_id text, method_id text, active integer, time_created integer NOT NULL, time_updated integer NOT NULL
+  );
   CREATE TABLE session (
     id text PRIMARY KEY, parent_id text, title text, directory text, time_created integer, time_updated integer
   );
@@ -366,6 +390,120 @@ describe("OpenCode import reader", () => {
     expect(() => readOpenCodeSession({ database: file, sessionID: "ses_legacy", directory: state.path })).toThrow(
       "legacy session format",
     )
+  })
+
+  test("lists saved credentials without changing OpenCode data", async () => {
+    await using state = await tmpdir()
+    const file = path.join(state.path, "opencode", "opencode.db")
+    writeOpenCodeDatabase(file, false)
+    isolate(state.path, file)
+
+    const result = listOpenCodeCredentials()
+
+    expect(result.errors).toEqual([])
+    expect(result.databases).toEqual([path.resolve(file)])
+    expect(
+      result.credentials.map((credential) => [credential.id, credential.integrationID, credential.active]),
+    ).toEqual([
+      ["cred_active", "opencode", true],
+      ["cred_key", "openai", false],
+    ])
+    expect(result.credentials[0]!.value).toMatchObject({ type: "oauth", access: "st_test" })
+    expect(result.credentials[1]!.value).toEqual({ type: "key", key: "sk-test" })
+
+    const source = new Database(file, { readonly: true })
+    expect(source.query("SELECT COUNT(*) AS count FROM credential").get()).toEqual({ count: 2 })
+    source.close()
+  })
+
+  test("imports missing credentials and leaves an existing selection alone", async () => {
+    await using state = await tmpdir()
+    const file = path.join(state.path, "opencode", "opencode.db")
+    writeOpenCodeDatabase(file, false)
+    isolate(state.path, file)
+
+    const created: unknown[] = []
+    const result = await importOpenCodeCredentials({
+      credentials: listOpenCodeCredentials().credentials,
+      existing: [
+        {
+          id: "cred_existing",
+          integrationID: "opencode",
+          active: true,
+          value: { type: "key", key: "sk-existing" },
+        },
+        { id: "cred_key", integrationID: "openai", active: true, value: { type: "key", key: "sk-test" } },
+      ],
+      create: async (credential) => {
+        created.push(credential)
+      },
+    })
+
+    expect(result).toMatchObject({ imported: 1, skipped: 1, errors: [], integrations: ["opencode"] })
+    expect(created).toEqual([
+      {
+        id: "cred_active",
+        integrationID: "opencode",
+        label: "Personal",
+        value: { type: "oauth", methodID: "device", refresh: "rt_test", access: "st_test", expires: 100 },
+        activate: false,
+      },
+    ])
+  })
+
+  test("activates an imported credential when its integration has no selection", async () => {
+    await using state = await tmpdir()
+    const file = path.join(state.path, "opencode", "opencode.db")
+    writeOpenCodeDatabase(file, false)
+    isolate(state.path, file)
+
+    const created: unknown[] = []
+    const result = await importOpenCodeCredentials({
+      credentials: listOpenCodeCredentials().credentials,
+      existing: [
+        {
+          id: "cred_existing",
+          integrationID: "opencode",
+          active: false,
+          value: { type: "key", key: "sk-existing" },
+        },
+      ],
+      create: async (credential) => {
+        created.push(credential)
+      },
+    })
+
+    expect(result).toMatchObject({ imported: 2, skipped: 0, errors: [] })
+    expect(created).toMatchObject([
+      { id: "cred_active", integrationID: "opencode", activate: true },
+      { id: "cred_key", integrationID: "openai", activate: false },
+    ])
+  })
+
+  test("does not duplicate an equivalent credential stored under another id", async () => {
+    await using state = await tmpdir()
+    const file = path.join(state.path, "opencode", "opencode.db")
+    writeOpenCodeDatabase(file, false)
+    isolate(state.path, file)
+
+    const created: unknown[] = []
+    const result = await importOpenCodeCredentials({
+      credentials: listOpenCodeCredentials().credentials,
+      existing: [
+        {
+          id: "cred_other",
+          integrationID: "opencode",
+          value: { type: "oauth", methodID: "device", refresh: "rt_test", access: "st_test", expires: 100 },
+        },
+        { id: "cred_key", integrationID: "openai", value: { type: "key", key: "sk-test" } },
+      ],
+      create: async (credential) => {
+        created.push(credential)
+      },
+    })
+
+    expect(result).toMatchObject({ imported: 0, skipped: 2, errors: [] })
+    expect(created).toEqual([])
   })
 
   test("never reads a database inside LarpCode's own data root", async () => {

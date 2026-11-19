@@ -2098,6 +2098,15 @@ export type InstallationUpdateAvailable = {
   data: { version: string }
 }
 
+export type LarpcodeFallbackUsed = {
+  id: EventID
+  created: number
+  metadata?: { [x: string]: any }
+  type: "larpcode.fallback.used"
+  location?: LocationRef
+  data: { provider: "deepseek" | "pollinations"; at: number }
+}
+
 export type VcsBranchUpdated = {
   id: EventID
   created: number
@@ -2982,6 +2991,7 @@ export type V2Event =
   | TuiSessionSelect
   | InstallationUpdated
   | InstallationUpdateAvailable
+  | LarpcodeFallbackUsed
   | VcsBranchUpdated
   | McpStatusChanged
   | McpResourcesChanged
@@ -4488,6 +4498,7 @@ export type EventSubscribeInput = {
         | "tui.session.select"
         | "installation.updated"
         | "installation.update-available"
+        | "larpcode.fallback.used"
         | "vcs.branch.updated"
         | "mcp.status.changed"
         | "mcp.resources.changed"

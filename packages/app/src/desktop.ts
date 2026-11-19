@@ -12,6 +12,8 @@ export { ServerConnection, useServers } from "./runtime/server/registry"
 
 export { useGlobal } from "./runtime/server/runtime"
 
+export { DialogConnectProvider } from "./providers/connect/dialog"
+
 export { useTabs } from "./shell/tabs/tabs"
 
 export { createDraftStore } from "./runtime/persistence/drafts"

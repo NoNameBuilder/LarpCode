@@ -19,6 +19,7 @@ import { SettingsRow } from "@/settings/row"
 import { createShellOptions } from "./behavior"
 import { createOptimisticSetting, type ShellSettingsController } from "./controllers"
 import { InterfaceModeSetting } from "./interface-mode"
+import { LarpcodeEgressSection } from "./larpcode-egress"
 import "@/settings/settings.css"
 
 const AutoApprovePermissionsSetting: Component = () => {
@@ -323,6 +324,7 @@ export const SettingsGeneral: Component = () => {
       </div>
       <div class="settings-tab-body settings-tab-body--sectioned">
         <GeneralSection />
+        <LarpcodeEgressSection />
 
         <section class="settings-section" aria-label={language.t("settings.timeline.title")}>
           <h3 class="settings-section-title">{language.t("settings.timeline.title")}</h3>

@@ -2,7 +2,14 @@ import { existsSync, readdirSync, realpathSync, statSync } from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { Schema } from "effect"
-import type { ExperimentalSessionImportInput, JsonValue } from "@opencode/client"
+import {
+  isConflictError,
+  type CredentialCreateInput,
+  type ExperimentalSessionImportInput,
+  type JsonValue,
+} from "@opencode/client"
+import { Credential } from "@opencode/schema/credential"
+import { CredentialLegacy } from "@opencode/schema/credential-legacy"
 import { Session } from "@opencode/schema/session"
 import { SessionLegacy } from "@opencode/schema/session-legacy"
 import { SessionMessage } from "@opencode/schema/session-message"
@@ -10,11 +17,11 @@ import { Database } from "#zed-sqlite"
 import { errorMessage } from "./error"
 
 /**
- * Reads the sessions an installed OpenCode keeps in its own SQLite database.
+ * Reads the sessions and credentials an installed OpenCode keeps in its own SQLite database.
  *
  * LarpCode stores its state under its own application id, so these databases belong to OpenCode and are opened
- * read-only. Nothing here writes, migrates, or deletes OpenCode data; importing copies a transcript into the
- * current LarpCode location and leaves the source database untouched.
+ * read-only. Nothing here writes, migrates, or deletes OpenCode data; importing copies a transcript or a saved
+ * sign-in into the current LarpCode location and leaves the source database untouched.
  */
 
 type SQLValue = string | number | bigint | null | Uint8Array
@@ -54,17 +61,41 @@ export type OpenCodeImportData = {
   readonly messages: ExperimentalSessionImportInput["messages"]
 }
 
+export type OpenCodeCredential = {
+  /** The OpenCode database this credential was read from. */
+  readonly database: string
+  readonly id: string
+  readonly integrationID: string
+  readonly label: string
+  readonly active: boolean
+  readonly value: Credential.Value
+}
+
+export type OpenCodeCredentialList = {
+  readonly databases: readonly string[]
+  readonly credentials: readonly OpenCodeCredential[]
+  readonly errors: readonly string[]
+}
+
+export type OpenCodeCredentialImport = {
+  readonly imported: number
+  readonly skipped: number
+  readonly errors: readonly string[]
+  readonly integrations: readonly string[]
+}
+
 const mediaRef = /^media:([0-9a-f]{64})$/
 const databaseName = /^opencode(?:-[a-zA-Z0-9._-]+)?\.db$/i
 
 const decodeMessage = Schema.decodeUnknownSync(SessionMessage.Info)
 const encodeMessage = Schema.encodeSync(SessionMessage.Info)
+const decodeCredential = Schema.decodeUnknownSync(CredentialLegacy.Value)
 
 /** OpenCode databases, most explicit source first. Tests and advanced users can point these at a copied profile. */
-export function findOpenCodeDatabases() {
+export function findOpenCodeDatabases(options: { readonly home?: string } = {}) {
   const explicit = process.env.LARPCODE_OPENCODE_DB
   const explicitData = process.env.LARPCODE_OPENCODE_DATA
-  const home = os.homedir()
+  const home = options.home ?? os.homedir()
   const appData = process.env.APPDATA ?? path.join(home, "AppData", "Roaming")
   const candidates: string[] = []
   const excluded = [process.env.XDG_DATA_HOME, process.env.LARPCODE_DESKTOP_XDG_ROOT, process.env.OPENCODE_DB]
@@ -93,12 +124,9 @@ export function findOpenCodeDatabases() {
   addDirectory(explicitData)
   addDirectory(path.join(home, ".local", "share", "opencode"))
 
-  if (process.platform === "win32")
-    addDirectory(path.join(appData, "ai.opencode.desktop", "xdg", "data", "opencode"))
+  if (process.platform === "win32") addDirectory(path.join(appData, "ai.opencode.desktop", "xdg", "data", "opencode"))
   if (process.platform === "darwin")
-    addDirectory(
-      path.join(home, "Library", "Application Support", "ai.opencode.desktop", "xdg", "data", "opencode"),
-    )
+    addDirectory(path.join(home, "Library", "Application Support", "ai.opencode.desktop", "xdg", "data", "opencode"))
   if (process.platform === "linux")
     addDirectory(
       path.join(
@@ -123,8 +151,8 @@ export function findOpenCodeDatabases() {
   })
 }
 
-export function listOpenCodeSessions(): OpenCodeSessionList {
-  const databases = findOpenCodeDatabases()
+export function listOpenCodeSessions(options: { readonly home?: string } = {}): OpenCodeSessionList {
+  const databases = findOpenCodeDatabases(options)
   const sessions = new Map<string, OpenCodeSessionSummary>()
   const errors: string[] = []
   const readable: string[] = []
@@ -154,6 +182,140 @@ export function listOpenCodeSessions(): OpenCodeSessionList {
     sessions: [...sessions.values()].sort((a, b) => b.timeUpdated - a.timeUpdated),
     legacySessions,
     errors,
+  }
+}
+
+/**
+ * Lists credentials saved by an installed OpenCode. Like session import, this is read-only and deduplicates
+ * credentials that several OpenCode profiles share.
+ */
+export function listOpenCodeCredentials(options: { readonly home?: string } = {}): OpenCodeCredentialList {
+  const databases = findOpenCodeDatabases(options)
+  const credentials = new Map<string, OpenCodeCredential>()
+  const errors: string[] = []
+  const readable: string[] = []
+
+  for (const database of databases) {
+    try {
+      const result = listDatabaseCredentials(database)
+      readable.push(database)
+      errors.push(...result.errors)
+      for (const credential of result.credentials) {
+        const previous = credentials.get(credential.id)
+        if (!previous || (!previous.active && credential.active)) credentials.set(credential.id, credential)
+      }
+    } catch (error) {
+      errors.push(`${path.basename(database)}: ${errorMessage(error)}`)
+    }
+  }
+
+  return { databases: readable, credentials: [...credentials.values()], errors }
+}
+
+/**
+ * Copies discovered credentials into LarpCode through the server API. Destination selections are preserved:
+ * an imported credential only becomes active when its integration has no credential selected yet.
+ */
+export async function importOpenCodeCredentials(input: {
+  readonly credentials: readonly OpenCodeCredential[]
+  readonly existing: readonly {
+    readonly id: string
+    readonly integrationID: string
+    readonly active?: boolean | undefined
+    readonly value: unknown
+  }[]
+  readonly create: (credential: CredentialCreateInput) => Promise<unknown>
+}): Promise<OpenCodeCredentialImport> {
+  const ids = new Set(input.existing.map((credential) => credential.id))
+  const values = new Set(
+    input.existing.map((credential) => credentialValueKey(credential.integrationID, credential.value)),
+  )
+  const selected = new Set(
+    input.existing.filter((credential) => credential.active).map((credential) => credential.integrationID),
+  )
+  const importedIntegrations = new Set<string>()
+  const errors: string[] = []
+  let imported = 0
+  let skipped = 0
+
+  for (const credential of input.credentials) {
+    const key = credentialValueKey(credential.integrationID, credential.value)
+    if (ids.has(credential.id) || values.has(key)) {
+      skipped++
+      continue
+    }
+    try {
+      await input.create({
+        id: credential.id,
+        integrationID: credential.integrationID,
+        label: credential.label,
+        value: credential.value as CredentialCreateInput["value"],
+        activate: credential.active && !selected.has(credential.integrationID),
+      })
+      imported++
+      importedIntegrations.add(credential.integrationID)
+      ids.add(credential.id)
+      values.add(key)
+      if (credential.active) selected.add(credential.integrationID)
+    } catch (error) {
+      if (isConflictError(error)) {
+        skipped++
+        continue
+      }
+      errors.push(`${credential.label}: ${errorMessage(error)}`)
+    }
+  }
+
+  return { imported, skipped, errors, integrations: [...importedIntegrations] }
+}
+
+function credentialValueKey(integrationID: string, value: unknown) {
+  return JSON.stringify([integrationID, value])
+}
+
+function listDatabaseCredentials(database: string) {
+  const db = openReadOnly(database)
+  try {
+    const tables = tableNames(db)
+    if (!tables.has("credential")) return { credentials: [] as OpenCodeCredential[], errors: [] as string[] }
+    const columns = tableColumns(db, "credential")
+    if (!columns.has("integration_id")) return { credentials: [] as OpenCodeCredential[], errors: [] as string[] }
+
+    const order = columns.has("time_created") ? "time_created ASC, id ASC" : "id ASC"
+    const rows = all(
+      db,
+      `SELECT id, integration_id, label, active, value FROM credential WHERE integration_id IS NOT NULL ORDER BY ${order}`,
+    )
+    const credentials: OpenCodeCredential[] = []
+    const errors: string[] = []
+
+    for (const row of rows) {
+      if (!isRecord(row)) continue
+      const id = text(row.id)
+      const integrationID = text(row.integration_id)
+      const raw = text(row.value)
+      if (!id || !integrationID) continue
+      if (!raw) {
+        errors.push(`${path.basename(database)}: ${id} has no stored value`)
+        continue
+      }
+      try {
+        credentials.push({
+          database,
+          id,
+          integrationID,
+          label: text(row.label)?.trim() || integrationID,
+          active: row.active === 1 || row.active === true || row.active === "1",
+          value: decodeCredential(JSON.parse(raw)),
+        })
+      } catch (error) {
+        errors.push(`${path.basename(database)}: ${id}: ${errorMessage(error)}`)
+      }
+    }
+
+    return { credentials, errors }
+  } finally {
+    db.close()
   }
 }
 
@@ -256,9 +418,7 @@ function listDatabaseSessions(database: string) {
     if (tables.has("session")) {
       const columns = tableColumns(db, "session")
       const where = columns.has("parent_id") ? "s.parent_id IS NULL" : "1"
-      const excluded = tables.has("session_v2")
-        ? "AND NOT EXISTS (SELECT 1 FROM session_v2 v WHERE v.id = s.id)"
-        : ""
+      const excluded = tables.has("session_v2") ? "AND NOT EXISTS (SELECT 1 FROM session_v2 v WHERE v.id = s.id)" : ""
       const counted = get(db, `SELECT COUNT(*) AS count FROM session s WHERE ${where} ${excluded}`)
       legacySessions = isRecord(counted) ? number(counted.count) : 0
     }
@@ -270,11 +430,9 @@ function listDatabaseSessions(database: string) {
 }
 
 function readMessageRows(db: Connection, sessionID: string) {
-  return all(
-    db,
-    "SELECT id, type, data FROM session_message WHERE session_id = $sessionID ORDER BY seq ASC",
-    { sessionID },
-  ).map((row): { id: string; type: string; data: Record_ } => {
+  return all(db, "SELECT id, type, data FROM session_message WHERE session_id = $sessionID ORDER BY seq ASC", {
+    sessionID,
+  }).map((row): { id: string; type: string; data: Record_ } => {
     if (!isRecord(row) || typeof row.id !== "string" || typeof row.type !== "string")
       throw new Error("OpenCode returned a malformed session message.")
     const data = parseRecord(row.data)
@@ -304,8 +462,7 @@ function readParts(db: Connection, sessionID: string) {
 function hydrateMedia(db: Connection, messages: ReadonlyArray<{ data: Record_ }>, hasBlob: boolean) {
   const hashes = new Set<string>()
   for (const message of messages) {
-    if (Array.isArray(message.data.files))
-      for (const file of message.data.files) collectMedia(file, hashes)
+    if (Array.isArray(message.data.files)) for (const file of message.data.files) collectMedia(file, hashes)
     if (Array.isArray(message.data.content))
       for (const part of message.data.content) {
         if (!isRecord(part) || part.type !== "tool" || !isRecord(part.state)) continue
@@ -423,9 +580,7 @@ function sessionInfo(row: Record_, directory: string): ExperimentalSessionImport
       ...timeValue("viewed", row.time_viewed),
     },
     ...(title(row.title) ? { title: title(row.title) } : {}),
-    ...(metadata
-      ? { metadata: metadata as NonNullable<ExperimentalSessionImportInput["info"]["metadata"]> }
-      : {}),
+    ...(metadata ? { metadata: metadata as NonNullable<ExperimentalSessionImportInput["info"]["metadata"]> } : {}),
     location: { directory },
   }
 }

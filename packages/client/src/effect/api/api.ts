@@ -2175,6 +2175,7 @@ export type EventSubscribeInput = {
         | "tui.session.select"
         | "installation.updated"
         | "installation.update-available"
+        | "larpcode.fallback.used"
         | "vcs.branch.updated"
         | "mcp.status.changed"
         | "mcp.resources.changed"

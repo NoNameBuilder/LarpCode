@@ -150,6 +150,13 @@ export async function runNonInteractivePrompt(input: Input) {
         throw new Error("Event stream disconnected during prompt execution")
       }
       const event = next.value
+      // Fallback routing is server-wide, not session-scoped: the free request
+      // this run (or another client) sent was refused and is being answered by
+      // a fallback provider. Surface it before the session filters below.
+      if (event.type === "larpcode.fallback.used") {
+        render.fallback(event.data.provider, event.data.at)
+        continue
+      }
       if (event.type === "permission.asked") {
         if (await ownsSession(event.data.sessionID)) await replyPermission(event.data)
         continue
@@ -472,6 +479,17 @@ function renderer(input: Input) {
         UI.Style.TEXT_DIM +
           `waiting for ${jobs.length} background job${jobs.length === 1 ? "" : "s"}` +
           UI.Style.TEXT_NORMAL,
+      )
+    },
+
+    fallback: (provider: "deepseek" | "pollinations", at: number) => {
+      if (emit("fallback", at, { provider })) return
+      UI.println(
+        UI.Style.TEXT_WARNING_BOLD + "!",
+        UI.Style.TEXT_NORMAL +
+          `fallback in use: opencode.ai refused the free request; this reply is from ${
+            provider === "deepseek" ? "DeepSeek" : "Pollinations"
+          }`,
       )
     },
 

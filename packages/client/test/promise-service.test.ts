@@ -1,4 +1,6 @@
 import { expect, test } from "bun:test"
+import { rename } from "node:fs/promises"
+import { join } from "node:path"
 import { Service, type EnsureReason } from "../src/promise/service"
 import {
   catchesSigterm,
@@ -22,6 +24,22 @@ test("discovers a registered service", async () => {
     expect.objectContaining({ url: expect.stringMatching(/^http:\/\//) }),
   )
   expect(await Service.discover({ file: registration, version: "other" })).toBeUndefined()
+})
+
+test("discovers a service registered under another channel name", async () => {
+  await using fixture = await serviceFixture()
+  fixture.spawn("graceful")
+  await fixture.waitForFile()
+  const written = join(fixture.directory, "service-prod.json")
+  await rename(fixture.registration, written)
+
+  expect(
+    await Service.discover({
+      file: join(fixture.directory, "service-local.json"),
+      directory: fixture.directory,
+      version: "test",
+    }),
+  ).toEqual(expect.objectContaining({ url: (await Bun.file(written).json()).url }))
 })
 
 test("discovers a compatible registered service", async () => {
@@ -56,6 +74,22 @@ test("ensures a missing service with native promises", async () => {
 
   expect(endpoint.url).toBe(info.url)
   expect(starts).toEqual(["missing"])
+})
+
+test("adopts a started service that registers under another channel name", async () => {
+  await using fixture = await serviceFixture()
+  const written = join(fixture.directory, "service-prod.json")
+
+  const endpoint = await ensure({
+    file: join(fixture.directory, "service-local.json"),
+    directory: fixture.directory,
+    version: "test",
+    command: [process.execPath, join(import.meta.dir, "fixture", "service.ts"), written, "delayed", "10"],
+  })
+  const info = await Bun.file(written).json()
+  fixture.track(info.pid)
+
+  expect(endpoint.url).toBe(info.url)
 })
 
 test("adds configured environment variables with native promises", async () => {

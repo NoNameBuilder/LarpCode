@@ -11,8 +11,7 @@ import { SessionRunnerModel } from "./runner/model.js"
 const tokenSharingMessages = {
   subscription_sharing_user_not_eligible:
     "ChatGPT token sharing isn't available for this account. Connect with an API key or choose another provider.",
-  subscription_sharing_usage_limit_exceeded:
-    "ChatGPT usage limit reached. Check ChatGPT Settings → Usage for details.",
+  subscription_sharing_usage_limit_exceeded: "ChatGPT usage limit reached. Check ChatGPT Settings → Usage for details.",
   subscription_sharing_workplace_individual_usage_limit_exceeded:
     "You've reached the usage limit your ChatGPT workspace admin set for you. Ask them to raise it in the OpenAI Admin Console.",
   subscription_sharing_usage_unavailable: "ChatGPT usage can't be checked right now. Try again later.",
@@ -29,7 +28,7 @@ const tokenSharingMessages = {
 }
 
 const FREE_USAGE_LIMIT_MESSAGE =
-  "Free usage limit reached. LarpCode rotates the free route automatically, so retry the request or switch models."
+  "opencode.ai's shared free pool is refusing requests. This is not your local usage. LarpCode falls back automatically when enabled; retry or switch models."
 const BUDGET_LIMIT_MESSAGE = "Workspace usage limit reached. Model use is paused until the limit resets."
 const MODEL_BUDGET_LIMIT_MESSAGE = "You've reached the spend limit for this model. Switch models to keep going."
 

@@ -66,6 +66,7 @@ export default Runtime.handler(Commands.commands.settings, (input) =>
 
 type AutoJb = {
   enabled: boolean
+  profile: string
   content: "default" | "custom" | "empty"
   length?: number
   path: string
@@ -101,10 +102,11 @@ function render(report: Report, cliPath: string) {
     row("autoRotate", `${onOff(larpcode.settings.autoRotate)} (${larpcode.sources.autoRotate})`),
     row("autoRotateMaxPerHour", String(larpcode.settings.autoRotateMaxPerHour)),
     row("freeFallback", `${onOff(larpcode.settings.freeFallback)} (${larpcode.sources.freeFallback})`),
-    row("forceTor", `${onOff(larpcode.settings.forceTor)} (${larpcode.sources.forceTor})`),
+    row("egress", `${larpcode.settings.egress} (${larpcode.sources.egress})`),
+    row("forceTor", `${onOff(larpcode.settings.forceTor)} (legacy alias)`),
     row(
       "autoJb",
-      `${onOff(larpcode.autoJb.enabled)} · ${larpcode.autoJb.content}${
+      `${onOff(larpcode.autoJb.enabled)} · ${larpcode.autoJb.content} · profile ${larpcode.autoJb.profile}${
         larpcode.autoJb.length === undefined ? "" : ` (${larpcode.autoJb.length} chars)`
       }`,
     ),
@@ -191,16 +193,17 @@ function autoJb(data: string): AutoJb {
   const file = path.join(data, "larpcode-abliterated.json")
   try {
     const state = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>
-    if (!state || typeof state !== "object") return { enabled: false, content: "default", path: file }
+    if (!state || typeof state !== "object") return { enabled: false, profile: "auto", content: "default", path: file }
     const content = typeof state.content === "string" ? state.content : undefined
     return {
       enabled: state.enabled === true,
+      profile: typeof state.profile === "string" ? state.profile : "auto",
       content: content === undefined ? "default" : content.length === 0 ? "empty" : "custom",
       length: content?.length,
       path: file,
     }
   } catch {
-    return { enabled: false, content: "default", path: file }
+    return { enabled: false, profile: "auto", content: "default", path: file }
   }
 }
 

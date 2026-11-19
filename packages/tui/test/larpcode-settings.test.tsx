@@ -16,13 +16,30 @@ const session = {
   time: { created: 0, updated: 0 },
 }
 
-function payload(autoJb: boolean) {
+function payload(autoJb: boolean, selection: string) {
+  const active =
+    selection === "auto" ? profiles[0]! : (profiles.find((profile) => profile.id === selection) ?? profiles[0]!)
   return {
     ok: true,
-    settings: { autoRotate: true, autoRotateMaxPerHour: 30, freeFallback: true, forceTor: false },
-    sources: { autoRotate: "default", freeFallback: "default", forceTor: "default" },
+    settings: {
+      autoRotate: true,
+      autoRotateMaxPerHour: 30,
+      freeFallback: true,
+      forceTor: false,
+      egress: "warp",
+    },
+    sources: { autoRotate: "default", freeFallback: "default", forceTor: "default", egress: "default" },
     settingsPath: "C:\\data\\larpcode-settings.json",
-    autoJb: { enabled: autoJb, custom: false, length: 123231, defaultLength: 123231, max: 750000 },
+    autoJb: {
+      enabled: autoJb,
+      custom: false,
+      selection,
+      profiles,
+      active,
+      length: active.length,
+      defaultLength: profiles[0]!.length,
+      max: 750000,
+    },
     dependencies: [
       {
         id: "warp",
@@ -45,20 +62,55 @@ function payload(autoJb: boolean) {
   }
 }
 
+const profiles = [
+  {
+    id: "universal",
+    name: "Op Spec",
+    description: "The original universal Auto JB set.",
+    scope: "universal" as const,
+    length: 123231,
+  },
+  {
+    id: "bigpickle",
+    name: "Big Pickle",
+    description: "Universal persona set.",
+    scope: "universal" as const,
+    length: 94427,
+  },
+  {
+    id: "deepseek",
+    name: "DeepSeek V4.1",
+    description: "Model-specific set for DeepSeek.",
+    scope: "model" as const,
+    match: ["deepseek"],
+    length: 73231,
+  },
+]
+
 async function render(state: string) {
   let autoJb = false
+  let selection = "auto"
+  let freeRoute: unknown
   const toggles: string[] = []
   const resets: string[] = []
+  const profilesSaved: Array<Record<string, unknown>> = []
   return createAppFixture({
     state,
     args: { sessionID: session.id },
     config: { animations: false, tabs: { mode: "on" } },
-    fetch: (url) => {
-      if (url.pathname === "/_larpcode/settings") return json(payload(autoJb))
+    fetch: async (url, request) => {
+      if (url.pathname === "/_larpcode/settings")
+        return json({ ...payload(autoJb, selection), ...(freeRoute ? { freeRoute } : {}) })
       if (url.pathname === "/_larpcode/abliterated") {
         toggles.push(url.search)
         autoJb = url.searchParams.get("enabled") === "1"
         return json({ ok: true, enabled: autoJb })
+      }
+      if (url.pathname === "/_larpcode/abliterated/content" && request.method === "POST") {
+        const body = (await request.json()) as Record<string, unknown>
+        profilesSaved.push(body)
+        if (typeof body.profile === "string") selection = body.profile
+        return json({ ok: true, custom: false, selection, length: 0 })
       }
       if (url.pathname === "/_larpcode/reset-limits") {
         resets.push(url.search)
@@ -80,7 +132,15 @@ async function render(state: string) {
         })
       return undefined
     },
-  }).then((setup) => ({ setup, toggles, resets }))
+  }).then((setup) => ({
+    setup,
+    toggles,
+    resets,
+    profilesSaved,
+    setFreeRoute(value: unknown) {
+      freeRoute = value
+    },
+  }))
 }
 
 test("the LarpCode menu opens from the top-right control and toggles Auto JB", async () => {
@@ -106,6 +166,16 @@ test("the LarpCode menu opens from the top-right control and toggles Auto JB", a
   expect(rendered.toggles).toEqual(["?enabled=1"])
   await setup.waitForFrame((frame) => frame.split("\n").some((line) => /Auto JB\s+on$/.test(line.trimEnd())))
 
+  setup.mockInput.pressArrow("left")
+  await setup.waitFor(() => rendered.toggles.length === 2)
+  expect(rendered.toggles.at(-1)).toBe("?enabled=0")
+  await setup.waitForFrame((frame) => frame.split("\n").some((line) => /Auto JB\s+off$/.test(line.trimEnd())))
+
+  setup.mockInput.pressArrow("right")
+  await setup.waitFor(() => rendered.toggles.length === 3)
+  expect(rendered.toggles.at(-1)).toBe("?enabled=1")
+  await setup.waitForFrame((frame) => frame.split("\n").some((line) => /Auto JB\s+on$/.test(line.trimEnd())))
+
   setup.mockInput.pressEscape()
   await setup.mockInput.typeText("/larpcode:settings")
   setup.mockInput.pressEnter()
@@ -118,4 +188,58 @@ test("the LarpCode menu opens from the top-right control and toggles Auto JB", a
   setup.mockInput.pressEnter()
   await setup.waitFor(() => rendered.resets.length === 1)
   expect(rendered.resets).toEqual([""])
-})
+}, 30_000)
+
+test("an explicit model-specific Auto JB profile is saved and shown in the menu", async () => {
+  await using state = await tmpdir()
+  const rendered = await render(state.path)
+  await using setup = rendered.setup
+
+  await setup.waitForFrame((frame) => frame.includes("LarpCode session"))
+  const marked = await setup.waitForFrame((frame) => frame.includes("⚙!"))
+  const row = marked.split("\n").findIndex((line) => line.includes("⚙!"))
+  const column = marked.split("\n")[row]!.indexOf("⚙!") + 1
+  await setup.mockMouse.click(column, row)
+
+  await setup.waitForFrame((frame) => frame.includes("Dependencies missing"))
+  await setup.mockInput.typeText("JB profile")
+  await setup.waitForFrame((frame) => frame.includes("JB profile"))
+  setup.mockInput.pressEnter()
+  await setup.waitForFrame((frame) => frame.includes("Auto JB profile"))
+
+  await setup.mockInput.typeText("DeepSeek")
+  await setup.waitForFrame((frame) => frame.includes("Model-specific · DeepSeek V4.1"))
+  setup.mockInput.pressEnter()
+
+  await setup.waitFor(() => rendered.profilesSaved.length === 1)
+  expect(rendered.profilesSaved).toEqual([{ profile: "deepseek" }])
+  await setup.waitForFrame((frame) =>
+    frame.split("\n").some((line) => /JB profile\s+DeepSeek V4\.1$/.test(line.trimEnd())),
+  )
+}, 30_000)
+
+test("a fallback event shows the provider notice and records the last fallback", async () => {
+  await using state = await tmpdir()
+  const rendered = await render(state.path)
+  await using setup = rendered.setup
+
+  await setup.waitForFrame((frame) => frame.includes("LarpCode session"))
+  const at = Date.now()
+  rendered.setFreeRoute({ cooling: false, lastFallback: { provider: "pollinations", at } })
+  setup.events.emit({
+    id: "evt_larpcode_fallback",
+    created: at,
+    type: "larpcode.fallback.used",
+    data: { provider: "pollinations", at },
+  })
+
+  await setup.waitForFrame((frame) => frame.includes("Fallback in use") && frame.includes("Pollinations"))
+
+  const marked = await setup.waitForFrame((frame) => frame.includes("⚙!"))
+  const row = marked.split("\n").findIndex((line) => line.includes("⚙!"))
+  const column = marked.split("\n")[row]!.indexOf("⚙!") + 1
+  await setup.mockMouse.click(column, row)
+  await setup.waitForFrame((frame) => frame.includes("LarpCode settings"))
+  await setup.mockInput.typeText("Last fallback")
+  await setup.waitForFrame((frame) => frame.includes("Last fallback") && frame.includes("pollinations"))
+}, 30_000)

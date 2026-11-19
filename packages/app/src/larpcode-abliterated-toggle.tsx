@@ -4,6 +4,7 @@ import { Dialog, DialogBody, DialogFooter, DialogHeader, DialogTitleGroup } from
 import { Icon } from "@opencode/ui/icon"
 import { Textarea } from "@opencode/ui/textarea"
 import { useDialog } from "@opencode/ui/context/dialog"
+import { uuid } from "@opencode/util/uuid"
 import { authTokenFromCredentials } from "@/runtime/server/api"
 import { useServers } from "@/runtime/server/registry"
 import { useLanguage } from "@/runtime/i18n/language"
@@ -25,26 +26,34 @@ export function LarpcodeAbliteratedToggle() {
   // setting instead of leaving the button pointed at a dead connection.
   const connection = createMemo(() => {
     const conn = servers.list.find((item) => "http" in item && item.http?.url)
+
     return conn && "http" in conn ? conn : undefined
   })
 
   const headers = (conn = connection()) => {
     if (!conn?.http) return undefined
     const result: Record<string, string> = {}
+
     if (conn.http.password) {
       result.authorization = `Basic ${authTokenFromCredentials({ password: conn.http.password })}`
     }
+
     return result
   }
 
   const refresh = async () => {
     const conn = connection()
+
     if (!conn?.http?.url) return
+
     try {
       const response = await fetch(new URL("/_larpcode/abliterated", conn.http.url), {
         headers: headers(conn),
       })
+
       if (!response.ok) return
+      // SAFETY: this app's sidecar publishes the Auto JB state this route returns.
+      // oxlint-disable-next-line anti-slop/require-safety-comment-for-type-assertion -- see SAFETY above
       const body = (await response.json()) as { enabled?: boolean }
       setEnabled(body.enabled === true)
       setAvailable(true)
@@ -62,16 +71,22 @@ export function LarpcodeAbliteratedToggle() {
 
   const toggle = async () => {
     const conn = connection()
+
     if (!conn?.http?.url || busy()) return
     const next = !enabled()
     setBusy(true)
+
     try {
-      const response = await fetch(
-        new URL(`/_larpcode/abliterated?enabled=${next ? 1 : 0}`, conn.http.url),
-        { method: "POST", headers: headers(conn) },
-      )
+      const response = await fetch(new URL(`/_larpcode/abliterated?enabled=${next ? 1 : 0}`, conn.http.url), {
+        method: "POST",
+        headers: headers(conn),
+      })
+
       if (!response.ok) return
+      // SAFETY: this app's sidecar returns the toggled Auto JB state for this POST.
+      // oxlint-disable-next-line anti-slop/require-safety-comment-for-type-assertion -- see SAFETY above
       const body = (await response.json()) as { ok?: boolean; enabled?: boolean }
+
       if (body.ok) setEnabled(body.enabled === true)
       setAvailable(true)
     } finally {
@@ -81,14 +96,9 @@ export function LarpcodeAbliteratedToggle() {
 
   const edit = () => {
     const conn = connection()
+
     if (!conn?.http?.url) return
-    dialog.show(() => (
-      <AutoJbEditor
-        url={conn.http.url}
-        headers={headers(conn)}
-        onSaved={() => void refresh()}
-      />
-    ))
+    dialog.show(() => <AutoJbEditor url={conn.http.url} headers={headers(conn)} onSaved={() => void refresh()} />)
   }
 
   return (
@@ -142,25 +152,44 @@ export function LarpcodeAbliteratedToggle() {
 // file the CLI reads. That keeps the library local and the behaviour shared.
 type AutoJbPreset = { id: string; name: string; content: string }
 
+type AutoJbProfile = {
+  id: string
+  name: string
+  description: string
+  scope: "universal" | "model"
+  match?: string[]
+  length: number
+}
+
 const PRESET_KEY = "larpcode.autoJb.presets"
+
 const MAX_PRESETS = 25
 
+// SAFETY: localStorage can hold any JSON another tab or an older build wrote; every field is checked before use.
+/* oxlint-disable anti-slop/no-runtime-typeof, anti-slop/require-safety-comment-for-type-assertion -- see SAFETY above */
 function readPresets(): AutoJbPreset[] {
   try {
     const raw = typeof localStorage === "undefined" ? null : localStorage.getItem(PRESET_KEY)
+
     if (!raw) return []
     const value = JSON.parse(raw) as unknown
+
     if (!Array.isArray(value)) return []
+
     return value.flatMap((item) => {
       if (!item || typeof item !== "object") return []
       const preset = item as Partial<AutoJbPreset>
-      if (typeof preset.id !== "string" || typeof preset.name !== "string" || typeof preset.content !== "string") return []
+
+      if (typeof preset.id !== "string" || typeof preset.name !== "string" || typeof preset.content !== "string")
+        return []
+
       return [{ id: preset.id, name: preset.name, content: preset.content }]
     })
   } catch {
     return []
   }
 }
+/* oxlint-enable anti-slop/no-runtime-typeof, anti-slop/require-safety-comment-for-type-assertion */
 
 function storePresets(list: AutoJbPreset[]) {
   try {
@@ -170,22 +199,21 @@ function storePresets(list: AutoJbPreset[]) {
   }
 }
 
-function AutoJbEditor(props: {
-  url: string
-  headers?: Record<string, string>
-  onSaved: () => void
-}) {
+function AutoJbEditor(props: { url: string; headers?: Record<string, string>; onSaved: () => void }) {
   const language = useLanguage()
   const dialog = useDialog()
   const [content, setContent] = createSignal("")
   const [, setFallback] = createSignal("")
   const [custom, setCustom] = createSignal(false)
+  const [selection, setSelection] = createSignal("auto")
+  const [profiles, setProfiles] = createSignal<AutoJbProfile[]>([])
+  const [activeProfile, setActiveProfile] = createSignal<AutoJbProfile>()
   const [max, setMax] = createSignal(1_000_000)
   const [loading, setLoading] = createSignal(true)
   const [busy, setBusy] = createSignal(false)
   const [error, setError] = createSignal<string>()
   const [presets, setPresets] = createSignal<AutoJbPreset[]>(readPresets())
-  const [selected, setSelected] = createSignal("default")
+  const [selected, setSelected] = createSignal("auto")
   const [naming, setNaming] = createSignal(false)
   const [presetName, setPresetName] = createSignal("")
   const [confirmPreset, setConfirmPreset] = createSignal(false)
@@ -194,26 +222,41 @@ function AutoJbEditor(props: {
   const load = async () => {
     setLoading(true)
     setError(undefined)
+
     try {
       const response = await fetch(new URL("/_larpcode/abliterated/content", props.url), {
         headers: props.headers,
       })
+
       if (!response.ok) throw new Error(`HTTP ${response.status}`)
+
+      // SAFETY: this app's sidecar publishes the editor state this route returns; older sidecars omit newer fields.
+      // oxlint-disable-next-line anti-slop/require-safety-comment-for-type-assertion -- see SAFETY above
       const body = (await response.json()) as {
         content?: string
         default?: string
         custom?: boolean
+        selection?: string
+        profiles?: AutoJbProfile[]
+        active?: AutoJbProfile
         max?: number
       }
+
       setContent(body.content ?? "")
       setFallback(body.default ?? "")
       setCustom(body.custom === true)
-      if (typeof body.max === "number" && body.max > 0) setMax(body.max)
-      // Older sidecars do not report the active preset; match by content.
+      setSelection(body.selection ?? "auto")
+      setProfiles(Array.isArray(body.profiles) ? body.profiles : [])
+      setActiveProfile(body.active)
+
+      if (body.max !== undefined && body.max > 0) setMax(body.max)
+      // Older sidecars do not report the active profile; fall back to auto.
       setSelected(
         body.custom !== true
-          ? "default"
-          : presets().find((preset) => preset.content === body.content)?.id ?? "custom",
+          ? body.selection !== undefined && body.selection !== "auto"
+            ? `profile:${body.selection}`
+            : "auto"
+          : (presets().find((preset) => preset.content === body.content)?.id ?? "custom"),
       )
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause))
@@ -224,40 +267,83 @@ function AutoJbEditor(props: {
 
   onMount(() => void load())
 
-  const persist = async (value: string, selection: string, reset = false) => {
+  const persist = async (value: string, chosen: string, reset = false) => {
     if (busy()) return false
+
     if (!reset && value.length > max()) {
       setError(language.t("user.autoJb.tooLarge", { count: max() }))
+
       return false
     }
+
     setBusy(true)
     setError(undefined)
+
     try {
       const response = await fetch(new URL("/_larpcode/abliterated/content", props.url), {
         method: "POST",
         headers: { ...props.headers, "content-type": "application/json" },
         body: JSON.stringify(reset ? { reset: true } : { content: value }),
       })
+
+      // SAFETY: this app's sidecar reports whether it saved the content and whether it is custom.
+      // oxlint-disable-next-line anti-slop/require-safety-comment-for-type-assertion -- see SAFETY above
       const body = (await response.json().catch(() => ({}))) as {
         ok?: boolean
         error?: string
         custom?: boolean
       }
+
       if (!response.ok || !body.ok) throw new Error(body.error ?? `HTTP ${response.status}`)
+
       if (reset) {
-        // The server restores the bundled text; reload it instead of leaving
-        // the editor blank after "Default".
+        // The server restores the selected profile; reload it instead of
+        // leaving the editor blank after "Reset to profile".
         await load()
         props.onSaved()
+
         return true
       }
+
       setContent(value)
       setCustom(body.custom === true)
-      setSelected(body.custom === true ? selection : "default")
+      setSelected(body.custom === true ? chosen : "auto")
       props.onSaved()
+
       return true
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause))
+
+      return false
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const persistProfile = async (profile: string) => {
+    if (busy()) return false
+    setBusy(true)
+    setError(undefined)
+
+    try {
+      const response = await fetch(new URL("/_larpcode/abliterated/content", props.url), {
+        method: "POST",
+        headers: { ...props.headers, "content-type": "application/json" },
+        body: JSON.stringify({ profile }),
+      })
+
+      // SAFETY: this app's sidecar reports whether it saved the selected profile.
+      // oxlint-disable-next-line anti-slop/require-safety-comment-for-type-assertion -- see SAFETY above
+      const body = (await response.json().catch(() => ({}))) as { ok?: boolean; error?: string }
+
+      if (!response.ok || !body.ok) throw new Error(body.error ?? `HTTP ${response.status}`)
+      await load()
+      props.onSaved()
+
+      return true
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause))
+
       return false
     } finally {
       setBusy(false)
@@ -265,48 +351,65 @@ function AutoJbEditor(props: {
   }
 
   const save = async () => {
+    if (selected() === "auto" || selected().startsWith("profile:")) {
+      dialog.close()
+
+      return
+    }
+
     if (await persist(content(), selected())) dialog.close()
   }
 
   const pick = (id: string) => {
-    if (id === "custom") return
-    const value = id === "default" ? undefined : presets().find((preset) => preset.id === id)?.content
+    if (id === "custom" || id === selected()) return
     setConfirmPreset(false)
     setConfirmPrompt(false)
-    if (id === "default") {
-      void persist("", "default", true)
+
+    if (id === "auto") {
+      void persistProfile("auto")
+
       return
     }
+
+    if (id.startsWith("profile:")) {
+      void persistProfile(id.slice("profile:".length))
+
+      return
+    }
+
+    const value = presets().find((preset) => preset.id === id)?.content
+
     if (value === undefined) return
     void persist(value, id)
   }
 
   const editContent = (value: string) => {
     setContent(value)
+
     if (selected() !== "custom") setSelected("custom")
   }
 
-  const presetId = () => {
-    // crypto.randomUUID needs a secure context and is missing from older
-    // Electron/WebKit builds on Linux; fall back to a time+random id.
-    const uuid = globalThis.crypto?.randomUUID
-    if (typeof uuid === "function") return uuid.call(globalThis.crypto)
-    return `preset-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
-  }
+  // The shared helper keeps the id generation safe on insecure origins and older
+  // Electron/WebKit builds, where crypto.randomUUID is missing or throws.
+  const presetId = () => uuid()
 
   const savePreset = async () => {
     const trimmed = presetName().trim()
+
     if (!trimmed || busy()) return
     const list = presets()
     const existing = list.find((preset) => preset.name.toLowerCase() === trimmed.toLowerCase())
+
     const preset: AutoJbPreset = {
       id: existing?.id ?? presetId(),
       name: trimmed,
       content: content(),
     }
+
     const next = existing
       ? list.map((item) => (item.id === existing.id ? preset : item))
       : [...list, preset].slice(-MAX_PRESETS)
+
     setPresets(next)
     storePresets(next)
     setPresetName("")
@@ -316,6 +419,7 @@ function AutoJbEditor(props: {
 
   const removePreset = () => {
     const id = selected()
+
     if (id === "default" || id === "custom") return
     const next = presets().filter((preset) => preset.id !== id)
     setPresets(next)
@@ -327,10 +431,16 @@ function AutoJbEditor(props: {
   const deletePrompt = async () => {
     if (!confirmPrompt()) {
       setConfirmPrompt(true)
+
       return
     }
+
     setConfirmPrompt(false)
-    await persist("", "default", true)
+    await persist("", "", true)
+  }
+
+  const resetPrompt = async () => {
+    await persist("", "", true)
   }
 
   const activePreset = () => presets().find((preset) => preset.id === selected())
@@ -338,10 +448,7 @@ function AutoJbEditor(props: {
   return (
     <Dialog size="large" containerClass="!h-[min(640px,86vh)] !w-[min(820px,92vw)]">
       <DialogHeader>
-        <DialogTitleGroup
-          title={language.t("user.autoJb.title")}
-          description={language.t("user.autoJb.description")}
-        />
+        <DialogTitleGroup title={language.t("user.autoJb.title")} description={language.t("user.autoJb.description")} />
       </DialogHeader>
       <DialogBody class="flex min-h-0 flex-col gap-2 px-4 pb-1">
         <Show when={error()}>
@@ -362,10 +469,19 @@ function AutoJbEditor(props: {
             onChange={(event) => pick(event.currentTarget.value)}
             class="h-7 min-w-0 flex-1 rounded-[6px] border border-v2-border-border-muted bg-v2-background-bg-base px-2 text-[12px] text-v2-text-text-base outline-none focus:border-v2-border-border-focus"
           >
-            <option value="default">{language.t("user.autoJb.presetDefault")}</option>
-            <For each={presets()}>
-              {(preset) => <option value={preset.id}>{preset.name}</option>}
+            <option value="auto">{language.t("user.autoJb.profileAuto")}</option>
+            <For each={profiles()}>
+              {(profile) => (
+                <option value={`profile:${profile.id}`}>
+                  {`${
+                    profile.scope === "model"
+                      ? language.t("user.autoJb.profileModel")
+                      : language.t("user.autoJb.profileUniversal")
+                  } · ${profile.name}`}
+                </option>
+              )}
             </For>
+            <For each={presets()}>{(preset) => <option value={preset.id}>{preset.name}</option>}</For>
             <Show when={selected() === "custom"}>
               <option value="custom">{language.t("user.autoJb.presetCustom")}</option>
             </Show>
@@ -400,11 +516,12 @@ function AutoJbEditor(props: {
               removePreset()
             }}
           >
-            {confirmPreset()
-              ? language.t("user.autoJb.deletePresetConfirm")
-              : language.t("user.autoJb.delete")}
+            {confirmPreset() ? language.t("user.autoJb.deletePresetConfirm") : language.t("user.autoJb.delete")}
           </Button>
         </div>
+        <Show when={!custom() && selection() === "auto"}>
+          <p class="text-[11px] text-v2-text-text-muted">{language.t("user.autoJb.profileAutoNote")}</p>
+        </Show>
         <Show when={naming()}>
           <div class="flex items-center gap-2">
             <input
@@ -415,6 +532,7 @@ function AutoJbEditor(props: {
               onInput={(event) => setPresetName(event.currentTarget.value)}
               onKeyDown={(event) => {
                 if (event.key === "Enter") void savePreset()
+
                 if (event.key === "Escape") setNaming(false)
               }}
               class="h-7 min-w-0 flex-1 rounded-[6px] border border-v2-border-border-muted bg-v2-background-bg-base px-2 text-[12px] text-v2-text-text-base outline-none focus:border-v2-border-border-focus"
@@ -438,8 +556,8 @@ function AutoJbEditor(props: {
         />
         <div class="flex items-center justify-between text-[11px] text-v2-text-text-muted">
           <span>
-            {language.t(custom() ? "user.autoJb.custom" : "user.autoJb.default")} ·{" "}
-            {language.t("user.autoJb.characters", { count: content().length })}
+            {custom() ? language.t("user.autoJb.custom") : (activeProfile()?.name ?? language.t("user.autoJb.default"))}{" "}
+            · {language.t("user.autoJb.characters", { count: content().length })}
           </span>
           <Show when={content().length > max()}>
             <span class="text-v2-state-fg-danger">{language.t("user.autoJb.tooLarge", { count: max() })}</span>
@@ -452,18 +570,14 @@ function AutoJbEditor(props: {
             {confirmPrompt() ? language.t("user.autoJb.deleteConfirm") : language.t("user.autoJb.deletePrompt")}
           </Button>
         </Show>
-        <Button variant="ghost" disabled={busy() || loading()} onClick={() => pick("default")}>
+        <Button variant="ghost" disabled={busy() || loading()} onClick={() => void resetPrompt()}>
           {language.t("user.autoJb.reset")}
         </Button>
         <div class="flex-1" />
         <Button variant="ghost" disabled={busy()} onClick={() => dialog.close()}>
           {language.t("user.autoJb.cancel")}
         </Button>
-        <Button
-          variant="submit"
-          disabled={busy() || loading() || content().length > max()}
-          onClick={() => void save()}
-        >
+        <Button variant="submit" disabled={busy() || loading() || content().length > max()} onClick={() => void save()}>
           {busy() ? language.t("user.autoJb.saving") : language.t("user.autoJb.save")}
         </Button>
       </DialogFooter>

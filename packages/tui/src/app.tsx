@@ -48,6 +48,7 @@ import {
 } from "./context/runtime"
 import { DialogProvider, useDialog } from "./ui/dialog"
 import { DialogIntegration } from "./component/dialog-integration"
+import { DialogCredentialImport } from "./component/dialog-credential-import"
 import { ErrorComponent } from "./component/error-component"
 import { PluginRouteMissing } from "./component/plugin-route-missing"
 import { EditorContextProvider } from "./context/editor"
@@ -75,6 +76,7 @@ import { DialogDebug } from "./component/dialog-debug"
 import { DialogPair } from "./component/dialog-pair"
 import { DialogHighlights } from "./component/dialog-highlights"
 import { claim } from "./util/highlights"
+import { listOpenCodeCredentials } from "./util/opencode-import"
 import { DialogThemeList } from "./component/dialog-theme-list"
 import { DialogHelp } from "./ui/dialog-help"
 import { DialogAgent } from "./component/dialog-agent"
@@ -729,12 +731,63 @@ function App() {
       .catch(toast.error)
   })
 
-  // Opens the release highlights once after an update, but only into an idle home screen during startup.
+  // Offers to import OpenCode sign-ins on the first idle startup, before any other startup dialog.
   const storage = useStorage()
   const paths = useTuiPaths()
+  const [credentialOnboarding, setCredentialOnboarding] = storage.store<{
+    decided?: boolean
+    result?: string
+    at?: number
+  }>("opencode-credential-import", { initial: {} })
+  let credentialChecked = false
+  // Test fixtures opt out of first-run onboarding so their request sequences stay deterministic.
+  const credentialPending = () => app.channel !== "test" && !credentialOnboarding.decided
+  const decideCredentials = (result: string) =>
+    setCredentialOnboarding((draft) => {
+      draft.decided = true
+      draft.result = result
+      draft.at = Date.now()
+    }).catch(toast.error)
+  createEffect(() => {
+    if (credentialChecked) return
+    if (!credentialPending()) {
+      credentialChecked = true
+      return
+    }
+    if (!plugins.ready() || client.connection.status() !== "connected") return
+    if (route.data.type !== "home" || dialog.stack.length > 0 || promptRef.current?.current.text) return
+    if (args.prompt || args.continue || args.sessionID || args.newSessionID) return
+    if (process.env.OPENCODE_DRIVE || process.env.OPENCODE_STORY || process.env.OPENCODE_ROUTE) return
+    credentialChecked = true
+    void client.api.credential
+      .list()
+      .then((existing) => {
+        if (existing.length > 0) return decideCredentials("already-connected")
+        const source = listOpenCodeCredentials({ home: paths.home })
+        if (source.credentials.length === 0) return decideCredentials("no-source")
+        // A dialog opened while credentials were read keeps priority. Leave the decision unrecorded so the
+        // prompt appears on the next start instead of replacing what the user is already doing.
+        if (dialog.stack.length > 0) return
+        dialog.replace(() => (
+          <DialogCredentialImport
+            list={source}
+            onDecided={(decision) => {
+              void decideCredentials(decision)
+            }}
+          />
+        ))
+      })
+      .catch((error) => {
+        credentialChecked = false
+        toast.error(error)
+      })
+  })
+
+  // Opens the release highlights once after an update, but only into an idle home screen during startup.
   let highlighted = false
   createEffect(() => {
-    if (highlighted || !plugins.ready() || client.connection.status() !== "connected") return
+    if (highlighted || credentialPending()) return
+    if (!plugins.ready() || client.connection.status() !== "connected") return
     highlighted = true
     const items = app.highlights ?? []
     if (config.data.highlights === false) return

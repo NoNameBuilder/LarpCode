@@ -354,6 +354,18 @@ export function installGlobalFetchOverride(): { installed: boolean; reason?: str
   return { installed: true }
 }
 
+// Remove the process-level Tor router. Used when the user switches the LarpCode
+// egress setting back to WARP without restarting the sidecar; the caller
+// reinstalls the TLS-impersonation wrapper afterwards.
+export function uninstallGlobalFetchOverride(): { removed: boolean } {
+  if (!_globalFetchOverridden || !_originalGlobalFetch) return { removed: false }
+  ;(globalThis as { fetch: typeof globalThis.fetch }).fetch = _originalGlobalFetch
+  _globalFetchOverridden = false
+  _originalGlobalFetch = null
+  diag(`[global-fetch] override removed`)
+  return { removed: true }
+}
+
 // For the reset handler: tear down the global dispatcher so idle keep-alive
 // sockets through the OLD tor circuit are dropped, then rebuild it fresh so
 // the next request opens a new SOCKS tunnel (which lands on the new circuit
